@@ -6,28 +6,27 @@ import time
 from datetime import datetime, timezone, timedelta
 import re
 import os
-import gspread
-from google.oauth2.service_account import Credentials
+
+# ----------------- 絕對防彈：套件載入保護網 -----------------
+# 避免因為忘記安裝 gspread 而導致整個網站白畫面崩潰
+try:
+    import gspread
+    from google.oauth2.service_account import Credentials
+    GSPREAD_AVAILABLE = True
+except ImportError:
+    GSPREAD_AVAILABLE = False
 
 # 設定網頁佈局
 st.set_page_config(page_title="台股成交金額 TOP30 監控系統", layout="wide", page_icon="🔥")
 
 # 1. 基本參數設定
 tw_tz = timezone(timedelta(hours=8))
-HISTORY_FILE = "history_top30.csv" # 備用本地檔案
+HISTORY_FILE = "history_top30.csv" 
 # 👇 ！！！請將這裡替換成你剛剛建立的 Google 試算表網址！！！ 👇
-GOOGLE_SHEET_URL = "https://docs.google.com/spreadsheets/d/1lTRxbT9iv3uRIrQ1wUFPV0LZbo8p5Qoh4a1FMGa-iU4/edit?usp=sharing"
+GOOGLE_SHEET_URL = "https://docs.google.com/spreadsheets/d/你的試算表ID/edit"
 
 # 2. 模擬的可轉債(CB)股票池 
-# (實務上需從櫃買中心爬取，這裡先列入幾檔常見熱門股做為示範)
 CB_STOCKS = {'2317', '2603', '3231', '1519', '1514', '2382', '2618', '2362'}
-
-# 3. 建立 requests Session
-if 'http_session' not in st.session_state:
-    st.session_state.http_session = requests.Session()
-    st.session_state.http_session.headers.update({
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
-    })
 
 def safe_float(text):
     cleaned = re.sub(r'[^\d.-]', '', text) 
@@ -38,11 +37,16 @@ def safe_float(text):
 
 # ----------------- 資料獲取與儲存區塊 -----------------
 
+# [修正] 移除了會引發崩潰的 st.session_state，回歸最穩定的單次請求
 @st.cache_data(ttl=180, show_spinner=False)
 def get_yahoo_turnover_top30():
     url = f"https://tw.stock.yahoo.com/rank/turnover?v={int(time.time())}"
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+        "Accept-Language": "zh-TW,zh;q=0.9,en-US;q=0.8,en;q=0.7"
+    }
     try:
-        response = st.session_state.http_session.get(url, timeout=10)
+        response = requests.get(url, headers=headers, timeout=10)
         response.raise_for_status()
         soup = BeautifulSoup(response.text, 'html.parser')
         
@@ -57,7 +61,7 @@ def get_yahoo_turnover_top30():
                 stock_name = name_block.text.strip() if name_block else "未知"
                 stock_id = ticker_block.text.replace('.TW', '').replace('.TWO', '').strip() if ticker_block else "未知"
                 
-                # [新增功能] 判斷是否有發行可轉債，加上專屬標記
+                # 判斷可轉債(CB)
                 if stock_id in CB_STOCKS:
                     stock_name = f"{stock_name} (CB)"
 
@@ -78,32 +82,35 @@ def get_yahoo_turnover_top30():
         return pd.DataFrame(columns=['股票代號', '股票名稱', '目前股價', '漲幅(%)', '成交金額(億)'])
 
 def update_and_load_history(df_current):
-    """優先嘗試 Google Sheets，失敗則自動降級使用 CSV"""
+    """優先嘗試 Google Sheets，失敗則自動降級使用 CSV (內建型別防呆)"""
     today_str = datetime.now(tw_tz).strftime('%Y-%m-%d')
     df_current_save = df_current.copy() if not df_current.empty else pd.DataFrame()
+    
+    # [修正] 強制轉字串，防止 pandas 把代號 2317 變成數字導致比對失敗
     if not df_current_save.empty:
         df_current_save['日期'] = today_str
+        df_current_save['股票代號'] = df_current_save['股票代號'].astype(str)
 
     try:
         # 嘗試連線 Google Sheets
-        if "gcp_service_account" in st.secrets:
+        if GSPREAD_AVAILABLE and hasattr(st, "secrets") and "gcp_service_account" in st.secrets:
             scopes = ['https://www.googleapis.com/auth/spreadsheets', 'https://www.googleapis.com/auth/drive']
             creds = Credentials.from_service_account_info(st.secrets["gcp_service_account"], scopes=scopes)
             gc = gspread.authorize(creds)
             sh = gc.open_by_url(GOOGLE_SHEET_URL)
             worksheet = sh.sheet1
             
-            # 讀取雲端歷史資料
             records = worksheet.get_all_records()
             df_hist = pd.DataFrame(records) if records else pd.DataFrame(columns=['股票代號', '股票名稱', '目前股價', '漲幅(%)', '成交金額(億)', '日期'])
             
+            if not df_hist.empty and '股票代號' in df_hist.columns:
+                df_hist['股票代號'] = df_hist['股票代號'].astype(str)
+            
             if not df_current_save.empty:
-                # 覆蓋今日資料並保留歷史
                 if not df_hist.empty and '日期' in df_hist.columns:
                     df_hist = df_hist[df_hist['日期'] != today_str]
                 df_hist = pd.concat([df_hist, df_current_save], ignore_index=True)
                 
-                # 寫回 Google Sheets
                 data_to_upload = [df_hist.columns.values.tolist()] + df_hist.values.tolist()
                 worksheet.clear()
                 worksheet.update(values=data_to_upload, range_name='A1')
@@ -111,21 +118,31 @@ def update_and_load_history(df_current):
             return df_hist
             
     except Exception as e:
-        st.sidebar.warning(f"Google Sheets 連線失敗，暫時使用本地 CSV。錯誤: {e}")
-        # --- 降級方案：使用原本的 CSV ---
-        if not df_current_save.empty:
-            if os.path.exists(HISTORY_FILE):
-                df_hist = pd.read_csv(HISTORY_FILE)
-                df_hist = df_hist[df_hist['日期'] != today_str]
-                df_hist = pd.concat([df_hist, df_current_save], ignore_index=True)
-            else:
-                df_hist = df_current_save
-            df_hist.to_csv(HISTORY_FILE, index=False)
-            return df_hist
+        if GSPREAD_AVAILABLE and hasattr(st, "secrets") and "gcp_service_account" in st.secrets:
+            st.sidebar.warning(f"Google 權限錯誤，暫時使用 CSV 紀錄。")
+            
+    # --- 降級方案：使用原本的 CSV ---
+    if not df_current_save.empty:
+        if os.path.exists(HISTORY_FILE):
+            df_hist = pd.read_csv(HISTORY_FILE)
+            if not df_hist.empty and '股票代號' in df_hist.columns:
+                df_hist['股票代號'] = df_hist['股票代號'].astype(str)
+                
+            df_hist = df_hist[df_hist['日期'] != today_str]
+            df_hist = pd.concat([df_hist, df_current_save], ignore_index=True)
         else:
-            return pd.read_csv(HISTORY_FILE) if os.path.exists(HISTORY_FILE) else pd.DataFrame()
+            df_hist = df_current_save
+        df_hist.to_csv(HISTORY_FILE, index=False)
+        return df_hist
+    else:
+        if os.path.exists(HISTORY_FILE):
+            df_hist = pd.read_csv(HISTORY_FILE)
+            if not df_hist.empty and '股票代號' in df_hist.columns:
+                df_hist['股票代號'] = df_hist['股票代號'].astype(str)
+            return df_hist
+        return pd.DataFrame()
 
-# ----------------- 樣式處理區塊 (保持不變) -----------------
+# ----------------- 樣式處理區塊 -----------------
 
 def style_realtime_dataframe(df, prev_day_set):
     def row_style(row):
@@ -136,7 +153,7 @@ def style_realtime_dataframe(df, prev_day_set):
         elif row['漲幅(%)'] < 0:
             styles[change_idx] = 'color: #00fa9a; font-weight: bold;' 
             
-        if len(prev_day_set) > 0 and row['股票代號'] not in prev_day_set:
+        if len(prev_day_set) > 0 and str(row['股票代號']) not in prev_day_set:
             styles = [s + 'background-color: rgba(255, 255, 0, 0.2);' for s in styles]
         return styles
 
@@ -161,12 +178,12 @@ def create_5days_history_styler(df_hist):
         prev_day_set = set()
         if i > 0:
             prev_date = recent_dates[i-1]
-            prev_day_set = set(df_hist[df_hist['日期'] == prev_date]['股票代號'])
+            prev_day_set = set(df_hist[df_hist['日期'] == prev_date]['股票代號'].astype(str))
         else:
             prev_idx = dates.index(current_date) - 1
             if prev_idx >= 0:
                 prev_date = dates[prev_idx]
-                prev_day_set = set(df_hist[df_hist['日期'] == prev_date]['股票代號'])
+                prev_day_set = set(df_hist[df_hist['日期'] == prev_date]['股票代號'].astype(str))
                 
         col_display = []
         col_style = []
@@ -182,7 +199,7 @@ def create_5days_history_styler(df_hist):
             elif change < 0:
                 css += "color: #00fa9a; font-weight: bold; "
                 
-            if row['股票代號'] not in prev_day_set and len(prev_day_set) > 0:
+            if str(row['股票代號']) not in prev_day_set and len(prev_day_set) > 0:
                 css += "background-color: rgba(255, 255, 0, 0.2); "
                 
             col_style.append(css)
@@ -195,12 +212,17 @@ def create_5days_history_styler(df_hist):
         style_dict[col_header] = col_style
 
     df_display = pd.DataFrame(display_dict)
-    df_display.index = [f"第 {idx} 名" for idx in range(1, 31)] 
+    if not df_display.empty:
+        df_display.index = [f"第 {idx} 名" for idx in range(1, 31)] 
     df_style = pd.DataFrame(style_dict, index=df_display.index)
 
     return df_display.style.apply(lambda _: df_style, axis=None)
 
 # ----------------- 主程式 UI -----------------
+# 側邊欄提示套件狀態
+if not GSPREAD_AVAILABLE:
+    st.sidebar.error("⚠️ 尚未安裝 Google 套件。請在終端機執行 `pip install gspread google-auth`。目前暫以 CSV 模式運作。")
+
 st.title("📈 台股成交金額 TOP30 雲端監控系統")
 
 # 獲取今日即時資料並更新資料庫
@@ -211,11 +233,11 @@ current_time_str = datetime.now(tw_tz).strftime('%H:%M:%S')
 # 找出「昨日」的名單供即時頁面比對
 today_str = datetime.now(tw_tz).strftime('%Y-%m-%d')
 yesterday_set = set()
-if not df_history_all.empty:
+if not df_history_all.empty and '日期' in df_history_all.columns:
     past_dates = sorted(df_history_all[df_history_all['日期'] < today_str]['日期'].unique())
     if past_dates:
         latest_past_date = past_dates[-1]
-        yesterday_set = set(df_history_all[df_history_all['日期'] == latest_past_date]['股票代號'])
+        yesterday_set = set(df_history_all[df_history_all['日期'] == latest_past_date]['股票代號'].astype(str))
 
 tab1, tab2 = st.tabs(["🔥 即時成交金額排行", "📅 歷史 5 日趨勢表"])
 
@@ -247,7 +269,7 @@ with tab1:
         styled_df = style_realtime_dataframe(df_current_top30, yesterday_set)
         st.dataframe(styled_df, use_container_width=True, height=1050)
     else:
-        st.warning("目前無法取得即時資料。")
+        st.warning("目前無法取得即時資料。可能網路中斷或非開盤時段。")
 
 # ==================== 分頁 2：歷史排行 ====================
 with tab2:
