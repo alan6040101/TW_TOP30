@@ -5,20 +5,20 @@ from bs4 import BeautifulSoup
 import time
 from datetime import datetime, timezone, timedelta
 import re
-import random
+import os
 
 # 設定網頁佈局
-st.set_page_config(page_title="台股成交金額 TOP30 儀表板", layout="wide", page_icon="🔥")
+st.set_page_config(page_title="台股成交金額 TOP30 監控系統", layout="wide", page_icon="🔥")
 
-# 1. 設定台灣時區 (UTC+8)
+# 1. 設定台灣時區與檔案路徑
 tw_tz = timezone(timedelta(hours=8))
+HISTORY_FILE = "history_top30.csv"
 
 # 2. 建立 requests Session (連線池)
 if 'http_session' not in st.session_state:
     st.session_state.http_session = requests.Session()
     st.session_state.http_session.headers.update({
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-        "Accept-Language": "zh-TW,zh;q=0.9,en-US;q=0.8,en;q=0.7"
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
     })
 
 def safe_float(text):
@@ -28,9 +28,8 @@ def safe_float(text):
     except ValueError:
         return 0.0
 
-# ----------------- 資料獲取區塊 -----------------
+# ----------------- 資料獲取與儲存區塊 -----------------
 
-# (保持不變) Yahoo 即時爬蟲
 @st.cache_data(ttl=180, show_spinner=False)
 def get_yahoo_turnover_top30():
     url = f"https://tw.stock.yahoo.com/rank/turnover?v={int(time.time())}"
@@ -55,12 +54,9 @@ def get_yahoo_turnover_top30():
                 change_pct = safe_float(prices_texts[2])
                     
                 turnover_str = prices_texts[-1]
-                if '億' in turnover_str:
-                    turnover = safe_float(turnover_str)
-                elif '萬' in turnover_str:
-                    turnover = safe_float(turnover_str) / 10000
-                else:
-                    turnover = safe_float(turnover_str)
+                if '億' in turnover_str: turnover = safe_float(turnover_str)
+                elif '萬' in turnover_str: turnover = safe_float(turnover_str) / 10000
+                else: turnover = safe_float(turnover_str)
                 
                 data.append([stock_id, stock_name, price, change_pct, turnover])
             except Exception:
@@ -69,55 +65,45 @@ def get_yahoo_turnover_top30():
     except Exception as e:
         return pd.DataFrame(columns=['股票代號', '股票名稱', '目前股價', '漲幅(%)', '成交金額(億)'])
 
-# [新增] 模擬歷史資料庫 (未來可替換為你的真實資料庫或 API)
-@st.cache_data(ttl=3600)
-def get_mock_historical_data(days_ago, current_df):
-    """
-    因為 Yahoo 沒提供歷史排行榜，這裡利用「今天的資料」加上隨機變化，
-    產生逼真的歷史數據，用來完美展示你要的 UI 邏輯。
-    """
-    if current_df.empty:
-        return current_df
+def update_and_load_history(df_current):
+    """將今日最新資料寫入 CSV，並回傳完整的歷史資料"""
+    today_str = datetime.now(tw_tz).strftime('%Y-%m-%d')
     
-    random.seed(datetime.now().day + days_ago) # 讓同一天的模擬資料固定
-    
-    hist_data = []
-    # 隨機保留 20~25 檔今天的股票，並加入一些隨機假股票來模擬「新進榜 / 掉出榜」的輪動
-    keep_count = random.randint(20, 25)
-    kept_rows = current_df.sample(n=keep_count).to_dict('records')
-    
-    for row in kept_rows:
-        row['漲幅(%)'] = round(random.uniform(-9.5, 9.5), 2)
-        row['成交金額(億)'] = round(row['成交金額(億)'] * random.uniform(0.8, 1.2), 2)
-        hist_data.append(row)
+    # 確保當前資料有日期欄位
+    if not df_current.empty:
+        df_current_save = df_current.copy()
+        df_current_save['日期'] = today_str
         
-    for i in range(30 - keep_count):
-        fake_id = f"23{random.randint(10, 99)}"
-        hist_data.append({
-            '股票代號': fake_id, '股票名稱': f"模擬股{fake_id}", 
-            '目前股價': round(random.uniform(50, 500), 2),
-            '漲幅(%)': round(random.uniform(-9.5, 9.5), 2),
-            '成交金額(億)': round(random.uniform(10, 100), 2)
-        })
-        
-    hist_df = pd.DataFrame(hist_data).sort_values(by='成交金額(億)', ascending=False).reset_index(drop=True)
-    return hist_df
+        if os.path.exists(HISTORY_FILE):
+            df_hist = pd.read_csv(HISTORY_FILE)
+            # 移除舊的「今日」資料，換成最新抓到的「今日」資料
+            df_hist = df_hist[df_hist['日期'] != today_str]
+            df_hist = pd.concat([df_hist, df_current_save], ignore_index=True)
+        else:
+            df_hist = df_current_save
+            
+        # 存檔
+        df_hist.to_csv(HISTORY_FILE, index=False)
+        return df_hist
+    else:
+        # 若當前沒抓到資料，僅讀取歷史紀錄
+        if os.path.exists(HISTORY_FILE):
+            return pd.read_csv(HISTORY_FILE)
+        else:
+            return pd.DataFrame()
 
-# ----------------- 樣式處理 -----------------
-def style_dataframe(df, prev_day_set):
-    """
-    共用樣式：紅漲、綠跌、與前一日比較的新進榜標示底色
-    """
+# ----------------- 樣式處理區塊 -----------------
+
+def style_realtime_dataframe(df, prev_day_set):
+    """即時分頁的樣式 (包含所有欄位)"""
     def row_style(row):
         styles = [''] * len(row)
         change_idx = df.columns.get_loc('漲幅(%)')
-        # 上漲紅，下跌綠
         if row['漲幅(%)'] > 0:
             styles[change_idx] = 'color: #ff4b4b; font-weight: bold;' 
         elif row['漲幅(%)'] < 0:
             styles[change_idx] = 'color: #00fa9a; font-weight: bold;' 
             
-        # 與前一日的名單比對，若不在裡面就是新進榜 (標示黃底)
         if len(prev_day_set) > 0 and row['股票代號'] not in prev_day_set:
             styles = [s + 'background-color: rgba(255, 255, 0, 0.2);' for s in styles]
         return styles
@@ -125,20 +111,90 @@ def style_dataframe(df, prev_day_set):
     return df.style.apply(row_style, axis=1)\
                    .format({'目前股價': '{:.2f}', '漲幅(%)': '{:+.2f}', '成交金額(億)': '{:.2f}'})
 
+def create_5days_history_styler(df_hist):
+    """產生歷史 5 日橫向比較表的專屬 DataFrame 與樣式"""
+    dates = sorted(df_hist['日期'].unique())
+    recent_dates = dates[-5:] # 取最近 5 天
+    
+    display_dict = {}
+    style_dict = {}
+
+    for i, current_date in enumerate(recent_dates):
+        # 1. 抓取該日資料
+        df_day = df_hist[df_hist['日期'] == current_date].copy()
+        df_day = df_day.sort_values(by='成交金額(億)', ascending=False).head(30).reset_index(drop=True)
+        
+        # 2. 計算上漲比例作為表頭
+        up_count = len(df_day[df_day['漲幅(%)'] > 0])
+        up_ratio = (up_count / len(df_day)) * 100 if len(df_day) > 0 else 0
+        col_header = f"{current_date} (上漲 {up_ratio:.0f}%)"
+        
+        # 3. 取得「該日的前一天」用來比較新進榜
+        prev_day_set = set()
+        if i > 0:
+            prev_date = recent_dates[i-1]
+            prev_day_set = set(df_hist[df_hist['日期'] == prev_date]['股票代號'])
+        else:
+            # 若為畫面上的第一天，去歷史紀錄找更前面的一天
+            prev_idx = dates.index(current_date) - 1
+            if prev_idx >= 0:
+                prev_date = dates[prev_idx]
+                prev_day_set = set(df_hist[df_hist['日期'] == prev_date]['股票代號'])
+                
+        # 4. 建立當日的顯示與樣式欄位
+        col_display = []
+        col_style = []
+        
+        for _, row in df_day.iterrows():
+            name = row['股票名稱']
+            change = row['漲幅(%)']
+            col_display.append(name)
+            
+            # 設定 CSS
+            css = "text-align: center; "
+            if change > 0:
+                css += "color: #ff4b4b; font-weight: bold; "
+            elif change < 0:
+                css += "color: #00fa9a; font-weight: bold; "
+                
+            if row['股票代號'] not in prev_day_set and len(prev_day_set) > 0:
+                css += "background-color: rgba(255, 255, 0, 0.2); "
+                
+            col_style.append(css)
+            
+        # 補齊 30 列 (若某天資料不足)
+        while len(col_display) < 30:
+            col_display.append("")
+            col_style.append("")
+            
+        display_dict[col_header] = col_display
+        style_dict[col_header] = col_style
+
+    df_display = pd.DataFrame(display_dict)
+    df_display.index = [f"第 {idx} 名" for idx in range(1, 31)] # 把索引改成 1~30 名
+    df_style = pd.DataFrame(style_dict, index=df_display.index)
+
+    # 將樣式對應套用
+    return df_display.style.apply(lambda _: df_style, axis=None)
+
 # ----------------- 主程式 UI -----------------
 st.title("📈 台股成交金額 TOP30 監控系統")
 
-# 使用 Streamlit 分頁功能
-tab1, tab2 = st.tabs(["🔥 即時成交金額排行", "📅 歷史成交金額排行"])
-
-# 先抓取今日即時資料 (供兩個分頁使用)
+# 獲取今日即時資料並更新資料庫
 df_current_top30 = get_yahoo_turnover_top30()
+df_history_all = update_and_load_history(df_current_top30)
 current_time_str = datetime.now(tw_tz).strftime('%H:%M:%S')
 
-# 推算「昨天」的資料 (用來當作今日的比較基準)
-df_yesterday_top30 = get_mock_historical_data(1, df_current_top30)
-yesterday_top30_set = set(df_yesterday_top30['股票代號']) if not df_yesterday_top30.empty else set()
+# 找出「昨日」的名單供即時頁面比對
+today_str = datetime.now(tw_tz).strftime('%Y-%m-%d')
+yesterday_set = set()
+if not df_history_all.empty:
+    past_dates = sorted(df_history_all[df_history_all['日期'] < today_str]['日期'].unique())
+    if past_dates:
+        latest_past_date = past_dates[-1]
+        yesterday_set = set(df_history_all[df_history_all['日期'] == latest_past_date]['股票代號'])
 
+tab1, tab2 = st.tabs(["🔥 即時成交金額排行", "📅 歷史 5 日趨勢表"])
 
 # ==================== 分頁 1：即時排行 ====================
 with tab1:
@@ -146,7 +202,7 @@ with tab1:
     with col_ctrl1:
         auto_refresh = st.checkbox("開啟自動更新 (每 3 分鐘)", value=True, key="auto_refresh")
     with col_ctrl2:
-        if st.button("🔄 手動重新整理 (若不滿 3 分鐘將從快取讀取)"):
+        if st.button("🔄 手動重新整理"):
             st.rerun()
 
     if not df_current_top30.empty:
@@ -162,42 +218,27 @@ with tab1:
         col4.metric("🔥 多方勢力 (上漲比例)", f"{up_ratio:.1f} %")
 
         st.markdown("---")
-        st.subheader(f"📊 今日即時排行榜 (最後更新時間: {current_time_str})")
-        st.info("💡 整列顯示**黃色底色**代表與「昨日收盤」相比，今天新擠進前 30 名的強勢股。系統設定每 3 分鐘自動向伺服器請求一次數據。")
+        st.subheader(f"📊 今日即時排行榜 (最後更新: {current_time_str})")
+        st.info("💡 整列顯示**黃色底色**代表與「前一個交易日」相比，今天新擠進前 30 名的強勢股。")
 
-        # 套用樣式 (傳入昨天的名單作為比對基準)
-        styled_df = style_dataframe(df_current_top30, yesterday_top30_set)
+        styled_df = style_realtime_dataframe(df_current_top30, yesterday_set)
         st.dataframe(styled_df, use_container_width=True, height=1050)
     else:
-        st.warning("目前無法取得即時資料，請檢查網路連線或是否處於開盤時段。")
-
+        st.warning("目前無法取得即時資料。")
 
 # ==================== 分頁 2：歷史排行 ====================
 with tab2:
-    st.subheader("📅 近五日歷史成交排行榜 (模擬資料展示區)")
-    st.caption("註：因 Yahoo 未提供歷史排行，此處以模擬資料展示 UI 邏輯。未來可替換為真實資料庫。")
+    st.subheader("📅 近 5 日成交金額 TOP30 資金輪動表")
+    st.caption("說明：此表僅顯示股票名稱。**紅色**為當地上漲，**綠色**為當日下跌，**黃底**代表相對前一日的新進榜股票。欄位名稱包含當天的上漲比例。")
     
-    # 建立近五個交易日的選項 (簡單推算前 1~5 天)
-    history_dates = [(datetime.now(tw_tz) - timedelta(days=i)).strftime("%Y-%m-%d") for i in range(1, 6)]
-    selected_date_str = st.selectbox("請選擇查詢日期：", history_dates)
-    
-    # 根據選取的日期，推算它是「幾天前」
-    days_ago = history_dates.index(selected_date_str) + 1
-    
-    # 獲取「選取日」的資料
-    df_selected_day = get_mock_historical_data(days_ago, df_current_top30)
-    
-    # 獲取「選取日的前一天」的資料 (用來抓新進榜)
-    df_prev_day = get_mock_historical_data(days_ago + 1, df_current_top30)
-    prev_day_set = set(df_prev_day['股票代號']) if not df_prev_day.empty else set()
-    
-    if not df_selected_day.empty:
-        st.markdown(f"**{selected_date_str} 成交金額 TOP30** (黃色底色為相較於前一日的新進榜股票)")
-        styled_hist_df = style_dataframe(df_selected_day, prev_day_set)
-        st.dataframe(styled_hist_df, use_container_width=True, height=1050)
+    if not df_history_all.empty:
+        # 使用自訂的 Styler 產生 5 日比較表
+        styled_hist_df = create_5days_history_styler(df_history_all)
+        st.dataframe(styled_hist_df, use_container_width=True, height=1100)
+    else:
+        st.info("目前還沒有足夠的歷史資料，資料將從今天開始自動累積！")
 
 # ==================== 自動更新邏輯 ====================
-# 放在最外層確保勾選後整個 App 都可以運作
 if 'auto_refresh' in st.session_state and st.session_state.auto_refresh:
     time.sleep(180) 
     st.rerun()
