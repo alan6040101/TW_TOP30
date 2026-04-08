@@ -6,15 +6,23 @@ import time
 from datetime import datetime, timezone, timedelta
 import re
 import os
+import gspread
+from google.oauth2.service_account import Credentials
 
 # 設定網頁佈局
 st.set_page_config(page_title="台股成交金額 TOP30 監控系統", layout="wide", page_icon="🔥")
 
-# 1. 設定台灣時區與檔案路徑
+# 1. 基本參數設定
 tw_tz = timezone(timedelta(hours=8))
-HISTORY_FILE = "history_top30.csv"
+HISTORY_FILE = "history_top30.csv" # 備用本地檔案
+# 👇 ！！！請將這裡替換成你剛剛建立的 Google 試算表網址！！！ 👇
+GOOGLE_SHEET_URL = "https://docs.google.com/spreadsheets/d/1lTRxbT9iv3uRIrQ1wUFPV0LZbo8p5Qoh4a1FMGa-iU4/edit?usp=sharing"
 
-# 2. 建立 requests Session (連線池)
+# 2. 模擬的可轉債(CB)股票池 
+# (實務上需從櫃買中心爬取，這裡先列入幾檔常見熱門股做為示範)
+CB_STOCKS = {'2317', '2603', '3231', '1519', '1514', '2382', '2618', '2362'}
+
+# 3. 建立 requests Session
 if 'http_session' not in st.session_state:
     st.session_state.http_session = requests.Session()
     st.session_state.http_session.headers.update({
@@ -49,6 +57,10 @@ def get_yahoo_turnover_top30():
                 stock_name = name_block.text.strip() if name_block else "未知"
                 stock_id = ticker_block.text.replace('.TW', '').replace('.TWO', '').strip() if ticker_block else "未知"
                 
+                # [新增功能] 判斷是否有發行可轉債，加上專屬標記
+                if stock_id in CB_STOCKS:
+                    stock_name = f"{stock_name} (CB)"
+
                 prices_texts = [c.text.strip() for c in cols]
                 price = safe_float(prices_texts[0])
                 change_pct = safe_float(prices_texts[2])
@@ -66,36 +78,56 @@ def get_yahoo_turnover_top30():
         return pd.DataFrame(columns=['股票代號', '股票名稱', '目前股價', '漲幅(%)', '成交金額(億)'])
 
 def update_and_load_history(df_current):
-    """將今日最新資料寫入 CSV，並回傳完整的歷史資料"""
+    """優先嘗試 Google Sheets，失敗則自動降級使用 CSV"""
     today_str = datetime.now(tw_tz).strftime('%Y-%m-%d')
-    
-    # 確保當前資料有日期欄位
-    if not df_current.empty:
-        df_current_save = df_current.copy()
+    df_current_save = df_current.copy() if not df_current.empty else pd.DataFrame()
+    if not df_current_save.empty:
         df_current_save['日期'] = today_str
-        
-        if os.path.exists(HISTORY_FILE):
-            df_hist = pd.read_csv(HISTORY_FILE)
-            # 移除舊的「今日」資料，換成最新抓到的「今日」資料
-            df_hist = df_hist[df_hist['日期'] != today_str]
-            df_hist = pd.concat([df_hist, df_current_save], ignore_index=True)
-        else:
-            df_hist = df_current_save
-            
-        # 存檔
-        df_hist.to_csv(HISTORY_FILE, index=False)
-        return df_hist
-    else:
-        # 若當前沒抓到資料，僅讀取歷史紀錄
-        if os.path.exists(HISTORY_FILE):
-            return pd.read_csv(HISTORY_FILE)
-        else:
-            return pd.DataFrame()
 
-# ----------------- 樣式處理區塊 -----------------
+    try:
+        # 嘗試連線 Google Sheets
+        if "gcp_service_account" in st.secrets:
+            scopes = ['https://www.googleapis.com/auth/spreadsheets', 'https://www.googleapis.com/auth/drive']
+            creds = Credentials.from_service_account_info(st.secrets["gcp_service_account"], scopes=scopes)
+            gc = gspread.authorize(creds)
+            sh = gc.open_by_url(GOOGLE_SHEET_URL)
+            worksheet = sh.sheet1
+            
+            # 讀取雲端歷史資料
+            records = worksheet.get_all_records()
+            df_hist = pd.DataFrame(records) if records else pd.DataFrame(columns=['股票代號', '股票名稱', '目前股價', '漲幅(%)', '成交金額(億)', '日期'])
+            
+            if not df_current_save.empty:
+                # 覆蓋今日資料並保留歷史
+                if not df_hist.empty and '日期' in df_hist.columns:
+                    df_hist = df_hist[df_hist['日期'] != today_str]
+                df_hist = pd.concat([df_hist, df_current_save], ignore_index=True)
+                
+                # 寫回 Google Sheets
+                data_to_upload = [df_hist.columns.values.tolist()] + df_hist.values.tolist()
+                worksheet.clear()
+                worksheet.update(values=data_to_upload, range_name='A1')
+                
+            return df_hist
+            
+    except Exception as e:
+        st.sidebar.warning(f"Google Sheets 連線失敗，暫時使用本地 CSV。錯誤: {e}")
+        # --- 降級方案：使用原本的 CSV ---
+        if not df_current_save.empty:
+            if os.path.exists(HISTORY_FILE):
+                df_hist = pd.read_csv(HISTORY_FILE)
+                df_hist = df_hist[df_hist['日期'] != today_str]
+                df_hist = pd.concat([df_hist, df_current_save], ignore_index=True)
+            else:
+                df_hist = df_current_save
+            df_hist.to_csv(HISTORY_FILE, index=False)
+            return df_hist
+        else:
+            return pd.read_csv(HISTORY_FILE) if os.path.exists(HISTORY_FILE) else pd.DataFrame()
+
+# ----------------- 樣式處理區塊 (保持不變) -----------------
 
 def style_realtime_dataframe(df, prev_day_set):
-    """即時分頁的樣式 (包含所有欄位)"""
     def row_style(row):
         styles = [''] * len(row)
         change_idx = df.columns.get_loc('漲幅(%)')
@@ -112,36 +144,30 @@ def style_realtime_dataframe(df, prev_day_set):
                    .format({'目前股價': '{:.2f}', '漲幅(%)': '{:+.2f}', '成交金額(億)': '{:.2f}'})
 
 def create_5days_history_styler(df_hist):
-    """產生歷史 5 日橫向比較表的專屬 DataFrame 與樣式"""
     dates = sorted(df_hist['日期'].unique())
-    recent_dates = dates[-5:] # 取最近 5 天
+    recent_dates = dates[-5:] 
     
     display_dict = {}
     style_dict = {}
 
     for i, current_date in enumerate(recent_dates):
-        # 1. 抓取該日資料
         df_day = df_hist[df_hist['日期'] == current_date].copy()
         df_day = df_day.sort_values(by='成交金額(億)', ascending=False).head(30).reset_index(drop=True)
         
-        # 2. 計算上漲比例作為表頭
         up_count = len(df_day[df_day['漲幅(%)'] > 0])
         up_ratio = (up_count / len(df_day)) * 100 if len(df_day) > 0 else 0
         col_header = f"{current_date} (上漲 {up_ratio:.0f}%)"
         
-        # 3. 取得「該日的前一天」用來比較新進榜
         prev_day_set = set()
         if i > 0:
             prev_date = recent_dates[i-1]
             prev_day_set = set(df_hist[df_hist['日期'] == prev_date]['股票代號'])
         else:
-            # 若為畫面上的第一天，去歷史紀錄找更前面的一天
             prev_idx = dates.index(current_date) - 1
             if prev_idx >= 0:
                 prev_date = dates[prev_idx]
                 prev_day_set = set(df_hist[df_hist['日期'] == prev_date]['股票代號'])
                 
-        # 4. 建立當日的顯示與樣式欄位
         col_display = []
         col_style = []
         
@@ -150,7 +176,6 @@ def create_5days_history_styler(df_hist):
             change = row['漲幅(%)']
             col_display.append(name)
             
-            # 設定 CSS
             css = "text-align: center; "
             if change > 0:
                 css += "color: #ff4b4b; font-weight: bold; "
@@ -162,7 +187,6 @@ def create_5days_history_styler(df_hist):
                 
             col_style.append(css)
             
-        # 補齊 30 列 (若某天資料不足)
         while len(col_display) < 30:
             col_display.append("")
             col_style.append("")
@@ -171,14 +195,13 @@ def create_5days_history_styler(df_hist):
         style_dict[col_header] = col_style
 
     df_display = pd.DataFrame(display_dict)
-    df_display.index = [f"第 {idx} 名" for idx in range(1, 31)] # 把索引改成 1~30 名
+    df_display.index = [f"第 {idx} 名" for idx in range(1, 31)] 
     df_style = pd.DataFrame(style_dict, index=df_display.index)
 
-    # 將樣式對應套用
     return df_display.style.apply(lambda _: df_style, axis=None)
 
 # ----------------- 主程式 UI -----------------
-st.title("📈 台股成交金額 TOP30 監控系統")
+st.title("📈 台股成交金額 TOP30 雲端監控系統")
 
 # 獲取今日即時資料並更新資料庫
 df_current_top30 = get_yahoo_turnover_top30()
@@ -219,7 +242,7 @@ with tab1:
 
         st.markdown("---")
         st.subheader(f"📊 今日即時排行榜 (最後更新: {current_time_str})")
-        st.info("💡 整列顯示**黃色底色**代表與「前一個交易日」相比，今天新擠進前 30 名的強勢股。")
+        st.info("💡 整列顯示**黃色底色**代表新進榜股票。名字後方帶有 **(CB)** 標籤代表該公司有發行可轉債。")
 
         styled_df = style_realtime_dataframe(df_current_top30, yesterday_set)
         st.dataframe(styled_df, use_container_width=True, height=1050)
@@ -229,14 +252,13 @@ with tab1:
 # ==================== 分頁 2：歷史排行 ====================
 with tab2:
     st.subheader("📅 近 5 日成交金額 TOP30 資金輪動表")
-    st.caption("說明：此表僅顯示股票名稱。**紅色**為當地上漲，**綠色**為當日下跌，**黃底**代表相對前一日的新進榜股票。欄位名稱包含當天的上漲比例。")
+    st.caption("說明：此表僅顯示股票名稱。**紅色**為當日上漲，**綠色**為當日下跌，**黃底**為新進榜股票。帶有 **(CB)** 代表具可轉債題材。")
     
     if not df_history_all.empty:
-        # 使用自訂的 Styler 產生 5 日比較表
         styled_hist_df = create_5days_history_styler(df_history_all)
         st.dataframe(styled_hist_df, use_container_width=True, height=1100)
     else:
-        st.info("目前還沒有足夠的歷史資料，資料將從今天開始自動累積！")
+        st.info("資料庫目前為空，資料將從今天開始自動累積！")
 
 # ==================== 自動更新邏輯 ====================
 if 'auto_refresh' in st.session_state and st.session_state.auto_refresh:
