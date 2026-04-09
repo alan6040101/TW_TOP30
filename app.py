@@ -23,7 +23,7 @@ st.set_page_config(page_title="台股成交金額 TOP30 監控系統", layout="w
 tw_tz = timezone(timedelta(hours=8))
 HISTORY_FILE = "history_top30.csv" 
 # 👇 ！！！請將這裡替換成你剛剛建立的 Google 試算表網址！！！ 👇
-GOOGLE_SHEET_URL = "https://docs.google.com/spreadsheets/d/你的試算表ID/edit"
+GOOGLE_SHEET_URL = "https://docs.google.com/spreadsheets/d/1lTRxbT9iv3uRIrQ1wUFPV0LZbo8p5Qoh4a1FMGa-iU4/edit?usp=sharing"
 
 # 2. 模擬的可轉債(CB)股票池 
 CB_STOCKS = {'2317', '2603', '3231', '1519', '1514', '2382', '2618', '2362'}
