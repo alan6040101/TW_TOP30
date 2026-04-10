@@ -19,35 +19,45 @@ st.set_page_config(page_title="台股成交金額 TOP30 監控系統", layout="w
 
 # 1. 基本參數設定
 tw_tz = timezone(timedelta(hours=8))
-# 請確認這裡是你的 Google 試算表網址
+# 你的 Google 試算表網址
 GOOGLE_SHEET_URL = "https://docs.google.com/spreadsheets/d/1lTRxbT9iv3uRIrQ1wUFPV0LZbo8p5Qoh4a1FMGa-iU4/edit?usp=sharing"
 
-# ❌ [已刪除] 模擬的 CB_STOCKS 股票池
-
-# ----------------- [新增] 真實可轉債(CB)動態爬蟲 -----------------
-@st.cache_data(ttl=3600, show_spinner=False) # 快取 1 小時，避免頻繁請求被鎖 IP
+# ----------------- [修正] 真實可轉債(CB)動態爬蟲 (避開櫃買阻擋) -----------------
+@st.cache_data(ttl=3600, show_spinner=False) 
 def get_real_cb_stock_ids():
     """
-    從櫃買中心(TPEx)爬取目前所有交易中的可轉債，
-    並自動萃取出對應的標的股票代號。
+    改從「嗨投資 (HiStock)」與「MoneyDJ」等較不易阻擋爬蟲的網站
+    爬取目前所有交易中的可轉債，避免櫃買中心(TPEx)嚴格的阻擋機制。
     """
+    cb_stock_ids = set()
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8"
+    }
+    
     try:
-        url = "https://www.tpex.org.tw/web/stock/convertible/daily_trade/cb_all_result.php?l=zh-tw"
-        headers = {"User-Agent": "Mozilla/5.0"}
-        res = requests.get(url, headers=headers, timeout=10)
-        data = res.json()
-        
-        cb_stock_ids = set()
-        if "aaData" in data:
-            for row in data["aaData"]:
-                # row[0] 是可轉債代號，例如 "23177" (鴻海七)
-                cb_code = row[0].strip()
-                # 台灣可轉債的標的股票代號通常是前 4 碼
-                stock_id = cb_code[:4]
-                cb_stock_ids.add(stock_id)
+        # 優先來源：HiStock 嗨投資
+        url_histock = "https://histock.tw/stock/cb.aspx"
+        res = requests.get(url_histock, headers=headers, timeout=10)
+        if res.status_code == 200:
+            # 尋找類似 /stock/23177 的連結，抓出 5 碼代號
+            cb_codes = re.findall(r'/stock/(\d{5})', res.text)
+            for code in cb_codes:
+                cb_stock_ids.add(code[:4]) # 前 4 碼為標的股票代號
+                
+        # 如果 HiStock 沒抓到，啟用備用來源：MoneyDJ
+        if not cb_stock_ids:
+            url_moneydj = "https://www.moneydj.com/z/zg/zgc/zgc_0.djhtm"
+            res2 = requests.get(url_moneydj, headers=headers, timeout=10)
+            if res2.status_code == 200:
+                # 尋找類似 zca_23177.djhtm 的連結，抓出 5 碼代號
+                cb_codes2 = re.findall(r'zca_(\d{5})\.djhtm', res2.text)
+                for code in cb_codes2:
+                    cb_stock_ids.add(code[:4])
+
         return cb_stock_ids
     except Exception as e:
-        # 若爬蟲失敗，在側邊欄提醒，但不影響主程式運行
+        # 即使發生錯誤，也不會報 json 錯，只會安靜地印出提示
         st.sidebar.warning(f"⚠️ CB 名單更新失敗，暫時略過標註。錯誤: {e}")
         return set()
 
@@ -62,7 +72,7 @@ def safe_float(text):
 
 @st.cache_data(ttl=180, show_spinner=False)
 def get_yahoo_turnover_top30():
-    # 👇 [修正] 取得真實的 CB 股票代號名單
+    # 取得真實的 CB 股票代號名單
     real_cb_ids = get_real_cb_stock_ids()
     
     url = f"https://tw.stock.yahoo.com/rank/turnover?v={int(time.time())}"
@@ -86,7 +96,7 @@ def get_yahoo_turnover_top30():
                 stock_name = name_block.text.strip() if name_block else "未知"
                 stock_id = ticker_block.text.replace('.TW', '').replace('.TWO', '').strip() if ticker_block else "未知"
                 
-                # 👇 [修正] 使用動態爬取的真實名單來判斷是否有 CB
+                # 使用動態爬取的真實名單來判斷是否有 CB
                 if stock_id in real_cb_ids:
                     stock_name = f"{stock_name} (CB)"
 
@@ -107,7 +117,7 @@ def get_yahoo_turnover_top30():
         return pd.DataFrame(columns=['股票代號', '股票名稱', '目前股價', '漲幅(%)', '成交金額(億)'])
 
 def update_and_load_history(df_current):
-    """(已移除地端 CSV，全 Google Sheets 雲端運作)"""
+    """雲端儲存邏輯 (保持不變)"""
     today_str = datetime.now(tw_tz).strftime('%Y-%m-%d')
     df_current_save = df_current.copy() if not df_current.empty else pd.DataFrame()
     
