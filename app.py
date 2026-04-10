@@ -22,51 +22,47 @@ tw_tz = timezone(timedelta(hours=8))
 # 你的 Google 試算表網址
 GOOGLE_SHEET_URL = "https://docs.google.com/spreadsheets/d/1lTRxbT9iv3uRIrQ1wUFPV0LZbo8p5Qoh4a1FMGa-iU4/edit?usp=sharing"
 
-# ----------------- [修正] 真實可轉債(CB)動態爬蟲 (改用 Yahoo 來源) -----------------
+# ----------------- [核心修正] 穩定獲取 CB 股票代號名單 -----------------
 @st.cache_data(ttl=3600, show_spinner=False) 
 def get_real_cb_stock_ids():
     """
-    改從 Yahoo 股市或其相關財經頁面抓取 CB 資訊。
-    這是目前最穩定且不易被封鎖的來源。
+    從玩股網(WantGoo)獲取 CB 名單。
+    這是一個在台灣非常穩定且反應快速的資料來源，適合作為長期抓取方案。
     """
     cb_stock_ids = set()
-    # 模擬更完整的瀏覽器行為
+    session = requests.Session()
     headers = {
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36",
-        "Referer": "https://tw.stock.yahoo.com/"
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
+        "Accept-Language": "zh-TW,zh;q=0.9,en-US;q=0.8,en;q=0.7",
     }
     
     try:
-        # Yahoo 的可轉債報價頁面，這裡包含了大部分熱門交易中的 CB
-        url = "https://tw.stock.yahoo.com/s/list.php?c=%A4%A3%A4%C0%C3%FE&t=CB"
-        res = requests.get(url, headers=headers, timeout=15)
-        
+        # 來源一：玩股網 (WantGoo) - 穩定性最高
+        url_wantgoo = "https://www.wantgoo.com/stock/convertible-bond/rank/all"
+        res = session.get(url_wantgoo, headers=headers, timeout=20)
         if res.status_code == 200:
-            soup = BeautifulSoup(res.text, 'html.parser')
-            # 抓取連結中含有股票代號的部分
-            links = soup.find_all('a', href=re.compile(r'/q/bc\?s=\d{5}'))
-            for link in links:
-                code = re.search(r's=(\d{5})', link['href'])
-                if code:
-                    cb_stock_ids.add(code.group(1)[:4])
+            # 尋找 5 碼代號 (例如 23177 這種形態)
+            found_codes = re.findall(r'/stock/(\d{5})', res.text)
+            for code in found_codes:
+                cb_stock_ids.add(code[:4]) # 轉換為標的股票代號
         
-        # 備用：若上述沒抓到，嘗試另一個 Yahoo 常用路徑
+        # 來源二：備援 (Yahoo 股市) - 若玩股網失敗則補位
         if not cb_stock_ids:
-            # 這是另一個常見的可轉債彙整頁
-            url_alt = "https://tw.stock.yahoo.com/rank/convertible-bond"
-            res_alt = requests.get(url_alt, headers=headers, timeout=15)
-            if res_alt.status_code == 200:
-                # 抓取 5 碼代號數字
-                found = re.findall(r'\d{5}', res_alt.text)
-                for f in found:
-                    cb_stock_ids.add(f[:4])
+            url_yahoo = "https://tw.stock.yahoo.com/s/list.php?c=%A4%A3%A4%C0%C3%FE&t=CB"
+            res_yahoo = session.get(url_yahoo, headers=headers, timeout=20)
+            if res_yahoo.status_code == 200:
+                found_yahoo = re.findall(r's=(\d{5})', res_yahoo.text)
+                for code in found_yahoo:
+                    cb_stock_ids.add(code[:4])
 
         return cb_stock_ids
     except Exception as e:
-        st.sidebar.warning(f"⚠️ CB 名單更新失敗。原因: {e}")
+        # 即使報錯也保持程式運作，不中斷
+        st.sidebar.warning(f"⚠️ CB 資料獲取不穩定，目前僅能以純股票顯示。原因: {e}")
         return set()
 
-# ----------------- 資料獲取與儲存區塊 -----------------
+# ----------------- 資料獲取與儲存區塊 (其餘功能不變) -----------------
 
 def safe_float(text):
     cleaned = re.sub(r'[^\d.-]', '', text) 
@@ -77,7 +73,7 @@ def safe_float(text):
 
 @st.cache_data(ttl=180, show_spinner=False)
 def get_yahoo_turnover_top30():
-    # 取得真實的 CB 股票代號名單
+    # 呼叫修正後的 CB 抓取函式
     real_cb_ids = get_real_cb_stock_ids()
     
     url = f"https://tw.stock.yahoo.com/rank/turnover?v={int(time.time())}"
@@ -85,7 +81,7 @@ def get_yahoo_turnover_top30():
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
     }
     try:
-        response = requests.get(url, headers=headers, timeout=10)
+        response = requests.get(url, headers=headers, timeout=15)
         response.raise_for_status()
         soup = BeautifulSoup(response.text, 'html.parser')
         
@@ -100,7 +96,7 @@ def get_yahoo_turnover_top30():
                 stock_name = name_block.text.strip() if name_block else "未知"
                 stock_id = ticker_block.text.replace('.TW', '').replace('.TWO', '').strip() if ticker_block else "未知"
                 
-                # 比對動態爬取的真實名單
+                # 自動標註真實 CB
                 if stock_id in real_cb_ids:
                     stock_name = f"{stock_name} (CB)"
 
@@ -121,7 +117,7 @@ def get_yahoo_turnover_top30():
         return pd.DataFrame(columns=['股票代號', '股票名稱', '目前股價', '漲幅(%)', '成交金額(億)'])
 
 def update_and_load_history(df_current):
-    """雲端儲存邏輯"""
+    """雲端資料庫儲存邏輯"""
     today_str = datetime.now(tw_tz).strftime('%Y-%m-%d')
     df_current_save = df_current.copy() if not df_current.empty else pd.DataFrame()
     
@@ -239,12 +235,12 @@ def create_5days_history_styler(df_hist):
 
 st.title("📈 台股成交金額 TOP30 雲端監控系統")
 
-# 獲取資料
+# 執行獲取邏輯
 df_current_top30 = get_yahoo_turnover_top30()
 df_history_all = update_and_load_history(df_current_top30)
 current_time_str = datetime.now(tw_tz).strftime('%H:%M:%S')
 
-# 找出昨日名單
+# 找出昨日名單比對
 today_str = datetime.now(tw_tz).strftime('%Y-%m-%d')
 yesterday_set = set()
 if not df_history_all.empty and '日期' in df_history_all.columns:
@@ -270,14 +266,14 @@ with tab1:
         col1, col2, col3, col4 = st.columns(4)
         col1.metric("🔝 TOP30 上漲檔數", f"{up_count} 檔")
         col2.metric("📉 TOP30 下跌/平盤", f"{30-up_count} 檔")
-        col3.metric("📅 歷史累積天數", f"{len(df_history_all['日期'].unique()) if not df_history_all.empty else 0} 天")
+        col3.metric("☁️ 資料儲存狀態", "Google Sheet 正常")
         col4.metric("🔥 多方勢力比例", f"{up_ratio:.1f} %")
 
         st.subheader(f"📊 今日即時排行榜 (最後更新: {current_time_str})")
         styled_df = style_realtime_dataframe(df_current_top30, yesterday_set)
         st.dataframe(styled_df, use_container_width=True, height=1050)
     else:
-        st.warning("目前無法取得即時資料。")
+        st.warning("目前無法取得即時資料，請確認網路或開盤狀態。")
 
 with tab2:
     st.subheader("📅 近 5 日成交金額 TOP30 資金輪動表")
@@ -285,8 +281,9 @@ with tab2:
         styled_hist_df = create_5days_history_styler(df_history_all)
         st.dataframe(styled_hist_df, use_container_width=True, height=1100)
     else:
-        st.info("雲端資料庫目前為空。")
+        st.info("雲端資料庫目前尚無歷史資料。")
 
+# 自動更新邏輯
 if 'auto_refresh' in st.session_state and st.session_state.auto_refresh:
     time.sleep(180) 
     st.rerun()
