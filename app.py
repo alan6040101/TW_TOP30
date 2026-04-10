@@ -5,13 +5,11 @@ from bs4 import BeautifulSoup
 import time
 from datetime import datetime, timezone, timedelta
 import re
-import os
+import gspread
+from google.oauth2.service_account import Credentials
 
 # ----------------- 絕對防彈：套件載入保護網 -----------------
-# 避免因為忘記安裝 gspread 而導致整個網站白畫面崩潰
 try:
-    import gspread
-    from google.oauth2.service_account import Credentials
     GSPREAD_AVAILABLE = True
 except ImportError:
     GSPREAD_AVAILABLE = False
@@ -21,12 +19,39 @@ st.set_page_config(page_title="台股成交金額 TOP30 監控系統", layout="w
 
 # 1. 基本參數設定
 tw_tz = timezone(timedelta(hours=8))
-HISTORY_FILE = "history_top30.csv" 
-# 👇 ！！！請將這裡替換成你剛剛建立的 Google 試算表網址！！！ 👇
+# 請確認這裡是你的 Google 試算表網址
 GOOGLE_SHEET_URL = "https://docs.google.com/spreadsheets/d/1lTRxbT9iv3uRIrQ1wUFPV0LZbo8p5Qoh4a1FMGa-iU4/edit?usp=sharing"
 
-# 2. 模擬的可轉債(CB)股票池 
-CB_STOCKS = {'2317', '2603', '3231', '1519', '1514', '2382', '2618', '2362'}
+# ❌ [已刪除] 模擬的 CB_STOCKS 股票池
+
+# ----------------- [新增] 真實可轉債(CB)動態爬蟲 -----------------
+@st.cache_data(ttl=3600, show_spinner=False) # 快取 1 小時，避免頻繁請求被鎖 IP
+def get_real_cb_stock_ids():
+    """
+    從櫃買中心(TPEx)爬取目前所有交易中的可轉債，
+    並自動萃取出對應的標的股票代號。
+    """
+    try:
+        url = "https://www.tpex.org.tw/web/stock/convertible/daily_trade/cb_all_result.php?l=zh-tw"
+        headers = {"User-Agent": "Mozilla/5.0"}
+        res = requests.get(url, headers=headers, timeout=10)
+        data = res.json()
+        
+        cb_stock_ids = set()
+        if "aaData" in data:
+            for row in data["aaData"]:
+                # row[0] 是可轉債代號，例如 "23177" (鴻海七)
+                cb_code = row[0].strip()
+                # 台灣可轉債的標的股票代號通常是前 4 碼
+                stock_id = cb_code[:4]
+                cb_stock_ids.add(stock_id)
+        return cb_stock_ids
+    except Exception as e:
+        # 若爬蟲失敗，在側邊欄提醒，但不影響主程式運行
+        st.sidebar.warning(f"⚠️ CB 名單更新失敗，暫時略過標註。錯誤: {e}")
+        return set()
+
+# ----------------- 資料獲取與儲存區塊 -----------------
 
 def safe_float(text):
     cleaned = re.sub(r'[^\d.-]', '', text) 
@@ -35,11 +60,11 @@ def safe_float(text):
     except ValueError:
         return 0.0
 
-# ----------------- 資料獲取與儲存區塊 -----------------
-
-# [修正] 移除了會引發崩潰的 st.session_state，回歸最穩定的單次請求
 @st.cache_data(ttl=180, show_spinner=False)
 def get_yahoo_turnover_top30():
+    # 👇 [修正] 取得真實的 CB 股票代號名單
+    real_cb_ids = get_real_cb_stock_ids()
+    
     url = f"https://tw.stock.yahoo.com/rank/turnover?v={int(time.time())}"
     headers = {
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
@@ -61,8 +86,8 @@ def get_yahoo_turnover_top30():
                 stock_name = name_block.text.strip() if name_block else "未知"
                 stock_id = ticker_block.text.replace('.TW', '').replace('.TWO', '').strip() if ticker_block else "未知"
                 
-                # 判斷可轉債(CB)
-                if stock_id in CB_STOCKS:
+                # 👇 [修正] 使用動態爬取的真實名單來判斷是否有 CB
+                if stock_id in real_cb_ids:
                     stock_name = f"{stock_name} (CB)"
 
                 prices_texts = [c.text.strip() for c in cols]
@@ -82,17 +107,15 @@ def get_yahoo_turnover_top30():
         return pd.DataFrame(columns=['股票代號', '股票名稱', '目前股價', '漲幅(%)', '成交金額(億)'])
 
 def update_and_load_history(df_current):
-    """優先嘗試 Google Sheets，失敗則自動降級使用 CSV (內建型別防呆)"""
+    """(已移除地端 CSV，全 Google Sheets 雲端運作)"""
     today_str = datetime.now(tw_tz).strftime('%Y-%m-%d')
     df_current_save = df_current.copy() if not df_current.empty else pd.DataFrame()
     
-    # [修正] 強制轉字串，防止 pandas 把代號 2317 變成數字導致比對失敗
     if not df_current_save.empty:
         df_current_save['日期'] = today_str
         df_current_save['股票代號'] = df_current_save['股票代號'].astype(str)
 
     try:
-        # 嘗試連線 Google Sheets
         if GSPREAD_AVAILABLE and hasattr(st, "secrets") and "gcp_service_account" in st.secrets:
             scopes = ['https://www.googleapis.com/auth/spreadsheets', 'https://www.googleapis.com/auth/drive']
             creds = Credentials.from_service_account_info(st.secrets["gcp_service_account"], scopes=scopes)
@@ -118,31 +141,11 @@ def update_and_load_history(df_current):
             return df_hist
             
     except Exception as e:
-        if GSPREAD_AVAILABLE and hasattr(st, "secrets") and "gcp_service_account" in st.secrets:
-            st.sidebar.warning(f"Google 權限錯誤，暫時使用 CSV 紀錄。")
-            
-    # --- 降級方案：使用原本的 CSV ---
-    if not df_current_save.empty:
-        if os.path.exists(HISTORY_FILE):
-            df_hist = pd.read_csv(HISTORY_FILE)
-            if not df_hist.empty and '股票代號' in df_hist.columns:
-                df_hist['股票代號'] = df_hist['股票代號'].astype(str)
-                
-            df_hist = df_hist[df_hist['日期'] != today_str]
-            df_hist = pd.concat([df_hist, df_current_save], ignore_index=True)
-        else:
-            df_hist = df_current_save
-        df_hist.to_csv(HISTORY_FILE, index=False)
-        return df_hist
-    else:
-        if os.path.exists(HISTORY_FILE):
-            df_hist = pd.read_csv(HISTORY_FILE)
-            if not df_hist.empty and '股票代號' in df_hist.columns:
-                df_hist['股票代號'] = df_hist['股票代號'].astype(str)
-            return df_hist
-        return pd.DataFrame()
+        st.sidebar.error(f"❌ Google Sheets 連線失敗: {e}")
+        
+    return pd.DataFrame()
 
-# ----------------- 樣式處理區塊 -----------------
+# ----------------- 樣式處理區塊 (保持不變) -----------------
 
 def style_realtime_dataframe(df, prev_day_set):
     def row_style(row):
@@ -219,9 +222,8 @@ def create_5days_history_styler(df_hist):
     return df_display.style.apply(lambda _: df_style, axis=None)
 
 # ----------------- 主程式 UI -----------------
-# 側邊欄提示套件狀態
 if not GSPREAD_AVAILABLE:
-    st.sidebar.error("⚠️ 尚未安裝 Google 套件。請在終端機執行 `pip install gspread google-auth`。目前暫以 CSV 模式運作。")
+    st.sidebar.error("⚠️ 尚未安裝 Google 套件。請在終端機執行 `pip install gspread google-auth`。")
 
 st.title("📈 台股成交金額 TOP30 雲端監控系統")
 
@@ -264,7 +266,7 @@ with tab1:
 
         st.markdown("---")
         st.subheader(f"📊 今日即時排行榜 (最後更新: {current_time_str})")
-        st.info("💡 整列顯示**黃色底色**代表新進榜股票。名字後方帶有 **(CB)** 標籤代表該公司有發行可轉債。")
+        st.info("💡 整列顯示**黃色底色**代表新進榜股票。名字後方帶有 **(CB)** 標籤代表由爬蟲偵測該公司目前有發行可轉債。")
 
         styled_df = style_realtime_dataframe(df_current_top30, yesterday_set)
         st.dataframe(styled_df, use_container_width=True, height=1050)
