@@ -183,7 +183,8 @@ def style_realtime_dataframe(df, prev_day_set):
     return df.style.apply(row_style, axis=1)\
                    .format({'目前股價': '{:.2f}', '漲幅(%)': '{:+.2f}', '成交金額(億)': '{:.2f}'})
 
-def create_5days_history_styler(df_hist):
+# [修正]: 傳入 real_cb_ids 來動態補上歷史資料的 CB 標籤
+def create_5days_history_styler(df_hist, real_cb_ids):
     dates = sorted(df_hist['日期'].unique())
     recent_dates = dates[-5:] 
     
@@ -212,8 +213,14 @@ def create_5days_history_styler(df_hist):
         col_style = []
         
         for _, row in df_day.iterrows():
-            name = row['股票名稱']
+            name = str(row['股票名稱'])
+            stock_id = str(row['股票代號'])
             change = row['漲幅(%)']
+            
+            # [修正]: 動態為歷史資料補上 (CB) 標記，並防止重複標記
+            if stock_id in real_cb_ids and "(CB)" not in name:
+                name = f"{name} (CB)"
+                
             col_display.append(name)
             
             css = "text-align: center; "
@@ -252,18 +259,15 @@ if IS_VALID_TRADING_DAY:
 else:
     st.warning("⏸️ 目前狀態：非交易時間或週末 (顯示最近一個交易日資料，不更新資料庫)")
 
-# [修正]: 根據是否為交易日決定資料讀取來源
 if IS_VALID_TRADING_DAY:
     df_current_top30 = get_yahoo_turnover_top30()
     df_history_all = update_and_load_history(df_current_top30)
 else:
-    # 非交易日，僅從資料庫載入歷史資料，不浪費資源抓取即時資料
     df_history_all = update_and_load_history(pd.DataFrame())
     df_current_top30 = pd.DataFrame()
 
 current_time_str = datetime.now(tw_tz).strftime('%H:%M:%S')
 
-# [修正]: 嚴格區分「交易日」與「非交易日」的顯示與比對邏輯
 today_str = datetime.now(tw_tz).strftime('%Y-%m-%d')
 display_date_str = today_str 
 yesterday_set = set()
@@ -273,25 +277,21 @@ if not df_history_all.empty and '日期' in df_history_all.columns:
     all_dates = sorted(df_history_all['日期'].unique())
     
     if IS_VALID_TRADING_DAY:
-        # 交易日：目前顯示的是即時資料，比對的是「小於今天的最後一筆紀錄」
         past_dates = [d for d in all_dates if d < today_str]
         if past_dates:
             latest_past_date = past_dates[-1]
             yesterday_set = set(df_history_all[df_history_all['日期'] == latest_past_date]['股票代號'].astype(str))
     else:
-        # 非交易日：從資料庫中抽取出「最後一個交易日」的資料來當作當前顯示
         if len(all_dates) >= 1:
             display_date_str = all_dates[-1]
             df_current_top30 = df_history_all[df_history_all['日期'] == display_date_str].copy()
             if '日期' in df_current_top30.columns:
                 df_current_top30 = df_current_top30.drop(columns=['日期'])
             
-            # 比對的基準則是「倒數第二個交易日」
             if len(all_dates) >= 2:
                 latest_past_date = all_dates[-2]
                 yesterday_set = set(df_history_all[df_history_all['日期'] == latest_past_date]['股票代號'].astype(str))
         else:
-            # 萬一資料庫完全是空的，作為最後防線抓取一次現況
             df_current_top30 = get_yahoo_turnover_top30()
 
 tab1, tab2 = st.tabs(["🔥 即時成交金額排行", "📅 歷史 5 日趨勢表"])
@@ -318,7 +318,6 @@ with tab1:
         col4.metric("🔥 多方勢力 (上漲比例)", f"{up_ratio:.1f} %")
 
         st.markdown("---")
-        # [修正]: 依據交易日與非交易日給予不同的標題提示
         if IS_VALID_TRADING_DAY:
             st.subheader(f"📊 今日即時排行榜 (最後更新: {current_time_str})")
         else:
@@ -337,7 +336,9 @@ with tab2:
     st.caption("說明：此表僅顯示股票名稱。**紅色**為當日上漲，**綠色**為當日下跌，**黃底**為新進榜股票。帶有 **(CB)** 代表具可轉債題材。")
     
     if not df_history_all.empty:
-        styled_hist_df = create_5days_history_styler(df_history_all)
+        # [修正]: 抓取最新的 CB 名單，並傳入歷史圖表函式中進行比對
+        real_cb_ids = get_real_cb_stock_ids()
+        styled_hist_df = create_5days_history_styler(df_history_all, real_cb_ids)
         st.dataframe(styled_hist_df, use_container_width=True, height=1100)
     else:
         st.info("資料庫目前為空，資料將在開盤日自動累積！")
