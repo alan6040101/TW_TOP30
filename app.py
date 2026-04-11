@@ -27,7 +27,7 @@ is_weekend = now_tw.weekday() >= 5  # 5:週六, 6:週日
 is_trading_time = now_tw.hour >= 9
 IS_VALID_TRADING_DAY = (not is_weekend) and is_trading_time
 
-# ----------------- [修正] 真實可轉債(CB)動態爬蟲 (指定來源 TheFew) -----------------
+# ----------------- 真實可轉債(CB)動態爬蟲 (指定來源 TheFew) -----------------
 @st.cache_data(ttl=3600, show_spinner=False) 
 def get_real_cb_stock_ids():
     """
@@ -44,7 +44,6 @@ def get_real_cb_stock_ids():
         res = requests.get(url_thefew, headers=headers, timeout=15)
         if res.status_code == 200:
             # 抓取 5 碼可轉債代碼 (例如 23177 -> 取前 4 碼 2317)
-            # 條件: 5位數字，且尾數通常為 1-9
             found_5_digits = re.findall(r'(?<!\d)([1-9]\d{3}[1-9])(?!\d)', res.text)
             for code in found_5_digits:
                 cb_stock_ids.add(code[:4])
@@ -52,13 +51,12 @@ def get_real_cb_stock_ids():
             # 抓取網頁中直接標示的 4 碼現股代碼
             found_4_digits = re.findall(r'(?<!\d)([1-9]\d{3})(?!\d)', res.text)
             for code in found_4_digits:
-                # 排除常見的年份數字以免誤判
                 if code not in ['2023', '2024', '2025', '2026', '2027']:
                     cb_stock_ids.add(code)
     except Exception as e:
         st.sidebar.warning(f"⚠️ TheFew 來源獲取超時，切換備援。")
 
-    # 備用來源：官方櫃買中心 API (防止 TheFew 改版或擋爬蟲)
+    # 備用來源：官方櫃買中心 API 
     if not cb_stock_ids:
         try:
             tpex_url = "https://www.tpex.org.tw/web/bond/tradeinfo/cb/cb_daily_qut_result.php?l=zh-tw&o=json"
@@ -129,7 +127,7 @@ def get_yahoo_turnover_top30():
         return pd.DataFrame(columns=['股票代號', '股票名稱', '目前股價', '漲幅(%)', '成交金額(億)'])
 
 def update_and_load_history(df_current):
-    """雲端儲存邏輯 - 加入非開盤日不紀錄的判斷"""
+    """雲端儲存邏輯"""
     today_str = datetime.now(tw_tz).strftime('%Y-%m-%d')
     df_current_save = df_current.copy() if not df_current.empty else pd.DataFrame()
     
@@ -151,10 +149,8 @@ def update_and_load_history(df_current):
             if not df_hist.empty and '股票代號' in df_hist.columns:
                 df_hist['股票代號'] = df_hist['股票代號'].astype(str)
             
-            # [修正]: 只有在「有效開盤日」才將今天的資料更新進去資料庫
             if not df_current_save.empty and IS_VALID_TRADING_DAY:
                 if not df_hist.empty and '日期' in df_hist.columns:
-                    # 避免重複寫入同一天
                     df_hist = df_hist[df_hist['日期'] != today_str]
                 df_hist = pd.concat([df_hist, df_current_save], ignore_index=True)
                 
@@ -169,7 +165,7 @@ def update_and_load_history(df_current):
         
     return pd.DataFrame()
 
-# ----------------- 樣式處理區塊 (保持不變) -----------------
+# ----------------- 樣式處理區塊 -----------------
 
 def style_realtime_dataframe(df, prev_day_set):
     def row_style(row):
@@ -251,26 +247,52 @@ if not GSPREAD_AVAILABLE:
 
 st.title("📈 台股成交金額 TOP30 雲端監控系統")
 
-# 狀態提示：告訴使用者目前是否為紀錄時段
 if IS_VALID_TRADING_DAY:
     st.success("🟢 目前狀態：交易日開盤時段 (資料自動紀錄更新中)")
 else:
-    st.warning("⏸️ 目前狀態：非交易時間或週末 (僅顯示最新狀態，不複寫歷史紀錄庫)")
+    st.warning("⏸️ 目前狀態：非交易時間或週末 (顯示最近一個交易日資料，不更新資料庫)")
 
-# 獲取今日即時資料並更新資料庫
-df_current_top30 = get_yahoo_turnover_top30()
-df_history_all = update_and_load_history(df_current_top30)
+# [修正]: 根據是否為交易日決定資料讀取來源
+if IS_VALID_TRADING_DAY:
+    df_current_top30 = get_yahoo_turnover_top30()
+    df_history_all = update_and_load_history(df_current_top30)
+else:
+    # 非交易日，僅從資料庫載入歷史資料，不浪費資源抓取即時資料
+    df_history_all = update_and_load_history(pd.DataFrame())
+    df_current_top30 = pd.DataFrame()
+
 current_time_str = datetime.now(tw_tz).strftime('%H:%M:%S')
 
-# [修正]: 嚴格找出「資料庫內有紀錄的最後一個開盤日」來當作「昨日名單」
+# [修正]: 嚴格區分「交易日」與「非交易日」的顯示與比對邏輯
 today_str = datetime.now(tw_tz).strftime('%Y-%m-%d')
+display_date_str = today_str 
 yesterday_set = set()
+latest_past_date = "無紀錄"
+
 if not df_history_all.empty and '日期' in df_history_all.columns:
-    # 只取小於今天的歷史紀錄日期
-    past_dates = sorted(df_history_all[df_history_all['日期'] < today_str]['日期'].unique())
-    if past_dates:
-        latest_past_date = past_dates[-1] # 這就是前一個真實開盤日
-        yesterday_set = set(df_history_all[df_history_all['日期'] == latest_past_date]['股票代號'].astype(str))
+    all_dates = sorted(df_history_all['日期'].unique())
+    
+    if IS_VALID_TRADING_DAY:
+        # 交易日：目前顯示的是即時資料，比對的是「小於今天的最後一筆紀錄」
+        past_dates = [d for d in all_dates if d < today_str]
+        if past_dates:
+            latest_past_date = past_dates[-1]
+            yesterday_set = set(df_history_all[df_history_all['日期'] == latest_past_date]['股票代號'].astype(str))
+    else:
+        # 非交易日：從資料庫中抽取出「最後一個交易日」的資料來當作當前顯示
+        if len(all_dates) >= 1:
+            display_date_str = all_dates[-1]
+            df_current_top30 = df_history_all[df_history_all['日期'] == display_date_str].copy()
+            if '日期' in df_current_top30.columns:
+                df_current_top30 = df_current_top30.drop(columns=['日期'])
+            
+            # 比對的基準則是「倒數第二個交易日」
+            if len(all_dates) >= 2:
+                latest_past_date = all_dates[-2]
+                yesterday_set = set(df_history_all[df_history_all['日期'] == latest_past_date]['股票代號'].astype(str))
+        else:
+            # 萬一資料庫完全是空的，作為最後防線抓取一次現況
+            df_current_top30 = get_yahoo_turnover_top30()
 
 tab1, tab2 = st.tabs(["🔥 即時成交金額排行", "📅 歷史 5 日趨勢表"])
 
@@ -296,13 +318,18 @@ with tab1:
         col4.metric("🔥 多方勢力 (上漲比例)", f"{up_ratio:.1f} %")
 
         st.markdown("---")
-        st.subheader(f"📊 今日即時排行榜 (最後更新: {current_time_str})")
-        st.info(f"💡 整列顯示**黃色底色**代表與 **前一個開盤日 ({latest_past_date if past_dates else '無紀錄'})** 相比的新進榜股票。名字後方帶有 **(CB)** 標籤代表具備可轉債題材。")
+        # [修正]: 依據交易日與非交易日給予不同的標題提示
+        if IS_VALID_TRADING_DAY:
+            st.subheader(f"📊 今日即時排行榜 (最後更新: {current_time_str})")
+        else:
+            st.subheader(f"📊 最近交易日 ({display_date_str}) 排行榜 (非交易時段)")
+            
+        st.info(f"💡 整列顯示**黃色底色**代表與 **前一個開盤日 ({latest_past_date})** 相比的新進榜股票。名字後方帶有 **(CB)** 標籤代表具備可轉債題材。")
 
         styled_df = style_realtime_dataframe(df_current_top30, yesterday_set)
         st.dataframe(styled_df, use_container_width=True, height=1050)
     else:
-        st.warning("目前無法取得即時資料。可能網路中斷或非開盤時段。")
+        st.warning("目前無法取得資料。請確認資料庫是否為空，或網路是否正常。")
 
 # ==================== 分頁 2：歷史排行 ====================
 with tab2:
