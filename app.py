@@ -22,47 +22,52 @@ tw_tz = timezone(timedelta(hours=8))
 # 你的 Google 試算表網址
 GOOGLE_SHEET_URL = "https://docs.google.com/spreadsheets/d/1lTRxbT9iv3uRIrQ1wUFPV0LZbo8p5Qoh4a1FMGa-iU4/edit?usp=sharing"
 
-# ----------------- [核心修正] 穩定獲取 CB 股票代號名單 -----------------
+# ----------------- [修正] 真實可轉債(CB)動態爬蟲 (改用官方 JSON API) -----------------
 @st.cache_data(ttl=3600, show_spinner=False) 
 def get_real_cb_stock_ids():
     """
-    從玩股網(WantGoo)獲取 CB 名單。
-    這是一個在台灣非常穩定且反應快速的資料來源，適合作為長期抓取方案。
+    改用台灣櫃買中心 (TPEx) 官方的 JSON API 作為主要來源。
+    官方來源穩定度極高，不會隨意阻擋，且回傳乾淨的 JSON 格式，不需解析 HTML。
     """
     cb_stock_ids = set()
-    session = requests.Session()
     headers = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36",
-        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
-        "Accept-Language": "zh-TW,zh;q=0.9,en-US;q=0.8,en;q=0.7",
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36"
     }
     
+    # 優先來源：櫃買中心官方每日可轉債交易資訊 (JSON)
     try:
-        # 來源一：玩股網 (WantGoo) - 穩定性最高
-        url_wantgoo = "https://www.wantgoo.com/stock/convertible-bond/rank/all"
-        res = session.get(url_wantgoo, headers=headers, timeout=20)
+        # 這是官方提供的即時/每日報價 JSON 端點
+        tpex_url = "https://www.tpex.org.tw/web/bond/tradeinfo/cb/cb_daily_qut_result.php?l=zh-tw&o=json"
+        res = requests.get(tpex_url, headers=headers, timeout=15)
         if res.status_code == 200:
-            # 尋找 5 碼代號 (例如 23177 這種形態)
-            found_codes = re.findall(r'/stock/(\d{5})', res.text)
-            for code in found_codes:
-                cb_stock_ids.add(code[:4]) # 轉換為標的股票代號
-        
-        # 來源二：備援 (Yahoo 股市) - 若玩股網失敗則補位
-        if not cb_stock_ids:
-            url_yahoo = "https://tw.stock.yahoo.com/s/list.php?c=%A4%A3%A4%C0%C3%FE&t=CB"
-            res_yahoo = session.get(url_yahoo, headers=headers, timeout=20)
-            if res_yahoo.status_code == 200:
-                found_yahoo = re.findall(r's=(\d{5})', res_yahoo.text)
-                for code in found_yahoo:
-                    cb_stock_ids.add(code[:4])
+            data = res.json()
+            if "aaData" in data and len(data["aaData"]) > 0:
+                for row in data["aaData"]:
+                    # 官方資料中，索引 1 通常是可轉債代碼 (例如 "23177")
+                    cb_code = str(row[1])
+                    if len(cb_code) >= 4:
+                        cb_stock_ids.add(cb_code[:4]) # 前 4 碼為標的股票代號
+                
+                if cb_stock_ids:
+                    return cb_stock_ids
+    except Exception:
+        pass # 若官方 API 偶發異常，默默進入備用來源
 
+    # 備用來源：玩股網 (WantGoo) 
+    # 伺服器在台灣，連線穩定且不易 Timeout
+    try:
+        url_wantgoo = "https://www.wantgoo.com/stock/convertible-bond/rank/all"
+        res2 = requests.get(url_wantgoo, headers=headers, timeout=15)
+        if res2.status_code == 200:
+            cb_codes2 = re.findall(r'/stock/(\d{5})', res2.text)
+            for code in cb_codes2:
+                cb_stock_ids.add(code[:4])
         return cb_stock_ids
     except Exception as e:
-        # 即使報錯也保持程式運作，不中斷
-        st.sidebar.warning(f"⚠️ CB 資料獲取不穩定，目前僅能以純股票顯示。原因: {e}")
+        st.sidebar.warning(f"⚠️ CB 名單更新失敗，暫時略過標註。錯誤: {e}")
         return set()
 
-# ----------------- 資料獲取與儲存區塊 (其餘功能不變) -----------------
+# ----------------- 資料獲取與儲存區塊 -----------------
 
 def safe_float(text):
     cleaned = re.sub(r'[^\d.-]', '', text) 
@@ -73,15 +78,16 @@ def safe_float(text):
 
 @st.cache_data(ttl=180, show_spinner=False)
 def get_yahoo_turnover_top30():
-    # 呼叫修正後的 CB 抓取函式
+    # 取得真實的 CB 股票代號名單
     real_cb_ids = get_real_cb_stock_ids()
     
     url = f"https://tw.stock.yahoo.com/rank/turnover?v={int(time.time())}"
     headers = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+        "Accept-Language": "zh-TW,zh;q=0.9,en-US;q=0.8,en;q=0.7"
     }
     try:
-        response = requests.get(url, headers=headers, timeout=15)
+        response = requests.get(url, headers=headers, timeout=10)
         response.raise_for_status()
         soup = BeautifulSoup(response.text, 'html.parser')
         
@@ -96,7 +102,7 @@ def get_yahoo_turnover_top30():
                 stock_name = name_block.text.strip() if name_block else "未知"
                 stock_id = ticker_block.text.replace('.TW', '').replace('.TWO', '').strip() if ticker_block else "未知"
                 
-                # 自動標註真實 CB
+                # 使用動態爬取的真實名單來判斷是否有 CB
                 if stock_id in real_cb_ids:
                     stock_name = f"{stock_name} (CB)"
 
@@ -117,7 +123,7 @@ def get_yahoo_turnover_top30():
         return pd.DataFrame(columns=['股票代號', '股票名稱', '目前股價', '漲幅(%)', '成交金額(億)'])
 
 def update_and_load_history(df_current):
-    """雲端資料庫儲存邏輯"""
+    """雲端儲存邏輯 (保持不變)"""
     today_str = datetime.now(tw_tz).strftime('%Y-%m-%d')
     df_current_save = df_current.copy() if not df_current.empty else pd.DataFrame()
     
@@ -232,15 +238,17 @@ def create_5days_history_styler(df_hist):
     return df_display.style.apply(lambda _: df_style, axis=None)
 
 # ----------------- 主程式 UI -----------------
+if not GSPREAD_AVAILABLE:
+    st.sidebar.error("⚠️ 尚未安裝 Google 套件。請在終端機執行 `pip install gspread google-auth`。")
 
 st.title("📈 台股成交金額 TOP30 雲端監控系統")
 
-# 執行獲取邏輯
+# 獲取今日即時資料並更新資料庫
 df_current_top30 = get_yahoo_turnover_top30()
 df_history_all = update_and_load_history(df_current_top30)
 current_time_str = datetime.now(tw_tz).strftime('%H:%M:%S')
 
-# 找出昨日名單比對
+# 找出「昨日」的名單供即時頁面比對
 today_str = datetime.now(tw_tz).strftime('%Y-%m-%d')
 yesterday_set = set()
 if not df_history_all.empty and '日期' in df_history_all.columns:
@@ -251,6 +259,7 @@ if not df_history_all.empty and '日期' in df_history_all.columns:
 
 tab1, tab2 = st.tabs(["🔥 即時成交金額排行", "📅 歷史 5 日趨勢表"])
 
+# ==================== 分頁 1：即時排行 ====================
 with tab1:
     col_ctrl1, col_ctrl2 = st.columns([2, 3])
     with col_ctrl1:
@@ -261,29 +270,37 @@ with tab1:
 
     if not df_current_top30.empty:
         up_count = len(df_current_top30[df_current_top30['漲幅(%)'] > 0])
+        down_count = len(df_current_top30[df_current_top30['漲幅(%)'] < 0])
+        flat_count = len(df_current_top30[df_current_top30['漲幅(%)'] == 0])
         up_ratio = (up_count / len(df_current_top30)) * 100 if len(df_current_top30) > 0 else 0
 
         col1, col2, col3, col4 = st.columns(4)
         col1.metric("🔝 TOP30 上漲檔數", f"{up_count} 檔")
-        col2.metric("📉 TOP30 下跌/平盤", f"{30-up_count} 檔")
-        col3.metric("☁️ 資料儲存狀態", "Google Sheet 正常")
-        col4.metric("🔥 多方勢力比例", f"{up_ratio:.1f} %")
+        col2.metric("📉 TOP30 下跌檔數", f"{down_count} 檔")
+        col3.metric("➖ TOP30 平盤檔數", f"{flat_count} 檔")
+        col4.metric("🔥 多方勢力 (上漲比例)", f"{up_ratio:.1f} %")
 
+        st.markdown("---")
         st.subheader(f"📊 今日即時排行榜 (最後更新: {current_time_str})")
+        st.info("💡 整列顯示**黃色底色**代表新進榜股票。名字後方帶有 **(CB)** 標籤代表由爬蟲偵測該公司目前有發行可轉債。")
+
         styled_df = style_realtime_dataframe(df_current_top30, yesterday_set)
         st.dataframe(styled_df, use_container_width=True, height=1050)
     else:
-        st.warning("目前無法取得即時資料，請確認網路或開盤狀態。")
+        st.warning("目前無法取得即時資料。可能網路中斷或非開盤時段。")
 
+# ==================== 分頁 2：歷史排行 ====================
 with tab2:
     st.subheader("📅 近 5 日成交金額 TOP30 資金輪動表")
+    st.caption("說明：此表僅顯示股票名稱。**紅色**為當日上漲，**綠色**為當日下跌，**黃底**為新進榜股票。帶有 **(CB)** 代表具可轉債題材。")
+    
     if not df_history_all.empty:
         styled_hist_df = create_5days_history_styler(df_history_all)
         st.dataframe(styled_hist_df, use_container_width=True, height=1100)
     else:
-        st.info("雲端資料庫目前尚無歷史資料。")
+        st.info("資料庫目前為空，資料將從今天開始自動累積！")
 
-# 自動更新邏輯
+# ==================== 自動更新邏輯 ====================
 if 'auto_refresh' in st.session_state and st.session_state.auto_refresh:
     time.sleep(180) 
     st.rerun()
