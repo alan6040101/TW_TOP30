@@ -112,8 +112,23 @@ def get_yahoo_turnover_top30():
 
                 prices_texts = [c.text.strip() for c in cols]
                 price = safe_float(prices_texts[0])
-                change_pct = safe_float(prices_texts[2])
-                    
+
+                # ---- 修正：從 HTML class 判斷漲跌方向 ----
+                # Yahoo 用顏色 class 區分：紅色(#ff333a)=上漲，綠色(#459b16)=下跌
+                change_col = cols[2] if len(cols) > 2 else None
+                change_pct_raw = safe_float(prices_texts[2])
+                if change_col:
+                    col_html = str(change_col)
+                    if 'C(#ff333a)' in col_html:
+                        change_pct = abs(change_pct_raw)    # 上漲為正
+                    elif 'C(#459b16)' in col_html:
+                        change_pct = -abs(change_pct_raw)   # 下跌為負
+                    else:
+                        change_pct = change_pct_raw         # 平盤
+                else:
+                    change_pct = change_pct_raw
+                # ---- 修正結束 ----
+
                 turnover_str = prices_texts[-1]
                 if '億' in turnover_str: turnover = safe_float(turnover_str)
                 elif '萬' in turnover_str: turnover = safe_float(turnover_str) / 10000
