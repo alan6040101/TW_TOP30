@@ -28,7 +28,7 @@ is_trading_time = now_tw.hour >= 9
 IS_VALID_TRADING_DAY = (not is_weekend) and is_trading_time
 
 # ----------------- 真實可轉債(CB)動態爬蟲 (指定來源 TheFew) -----------------
-@st.cache_data(ttl=3600, show_spinner=False) 
+@st.cache_data(ttl=3600, show_spinner=False)
 def get_real_cb_stock_ids():
     """
     從指定的 TheFew 網站抓取可轉債名單，並保留官方 API 備援。
@@ -37,26 +37,21 @@ def get_real_cb_stock_ids():
     headers = {
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36"
     }
-    
+
     try:
-        # 優先來源：使用者指定的 https://thefew.tw/cb
         url_thefew = "https://thefew.tw/cb"
         res = requests.get(url_thefew, headers=headers, timeout=15)
         if res.status_code == 200:
-            # 抓取 5 碼可轉債代碼 (例如 23177 -> 取前 4 碼 2317)
             found_5_digits = re.findall(r'(?<!\d)([1-9]\d{3}[1-9])(?!\d)', res.text)
             for code in found_5_digits:
                 cb_stock_ids.add(code[:4])
-                
-            # 抓取網頁中直接標示的 4 碼現股代碼
             found_4_digits = re.findall(r'(?<!\d)([1-9]\d{3})(?!\d)', res.text)
             for code in found_4_digits:
                 if code not in ['2023', '2024', '2025', '2026', '2027']:
                     cb_stock_ids.add(code)
-    except Exception as e:
-        st.sidebar.warning(f"⚠️ TheFew 來源獲取超時，切換備援。")
+    except Exception:
+        st.sidebar.warning("⚠️ TheFew 來源獲取超時，切換備援。")
 
-    # 備用來源：官方櫃買中心 API 
     if not cb_stock_ids:
         try:
             tpex_url = "https://www.tpex.org.tw/web/bond/tradeinfo/cb/cb_daily_qut_result.php?l=zh-tw&o=json"
@@ -76,7 +71,7 @@ def get_real_cb_stock_ids():
 # ----------------- 資料獲取與儲存區塊 -----------------
 
 def safe_float(text):
-    cleaned = re.sub(r'[^\d.-]', '', text) 
+    cleaned = re.sub(r'[^\d.-]', '', str(text))
     try:
         return float(cleaned) if cleaned else 0.0
     except ValueError:
@@ -85,67 +80,123 @@ def safe_float(text):
 @st.cache_data(ttl=180, show_spinner=False)
 def get_yahoo_turnover_top30():
     real_cb_ids = get_real_cb_stock_ids()
-    
-    url = f"https://tw.stock.yahoo.com/rank/turnover?v={int(time.time())}"
+
     headers = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+        "Accept": "application/json, text/javascript, */*; q=0.01",
+        "Referer": "https://tw.stock.yahoo.com/",
     }
+
+    data = []
+
+    # ======================================================
+    # 來源 1：台灣證交所 (上市) — 盤中即時成交金額排行
+    # 欄位說明 (MI_INDEX20):
+    #   row[0]=排名, row[1]=代號, row[2]=名稱,
+    #   row[3]=成交股數, row[4]=成交筆數, row[5]=成交金額(元),
+    #   row[6]=開盤, row[7]=最高, row[8]=最低, row[9]=收盤,
+    #   row[10]=漲跌符號(+/-), row[11]=漲跌價差
+    # ======================================================
     try:
-        response = requests.get(url, headers=headers, timeout=15)
-        response.raise_for_status()
-        soup = BeautifulSoup(response.text, 'html.parser')
-        
-        rows = soup.find_all('li', class_='List(n)')
-        data = []
-        for row in rows[:30]: 
-            cols = row.find_all('div', class_='Fxg(1)') 
-            if not cols: continue
-            try:
-                name_block = row.find('div', class_='Lh(20px)')
-                ticker_block = row.find('span', class_='C(#979ba7)')
-                stock_name = name_block.text.strip() if name_block else "未知"
-                stock_id = ticker_block.text.replace('.TW', '').replace('.TWO', '').strip() if ticker_block else "未知"
-                
-                # 標記 CB
-                if stock_id in real_cb_ids:
-                    stock_name = f"{stock_name} (CB)"
+        twse_url = (
+            "https://www.twse.com.tw/rwd/zh/afterTrading/MI_INDEX20"
+            "?response=json&_=" + str(int(time.time() * 1000))
+        )
+        res = requests.get(twse_url, headers=headers, timeout=15)
+        res.raise_for_status()
+        j = res.json()
+        if j.get("stat") == "OK" and "data" in j:
+            for row in j["data"]:
+                try:
+                    stock_id   = str(row[1]).strip()
+                    stock_name = str(row[2]).strip()
+                    close      = safe_float(str(row[9]).replace(",", ""))
+                    sign_str   = str(row[10]).strip()   # '+' 或 '-'
+                    diff_price = safe_float(str(row[11]).replace(",", ""))
 
-                prices_texts = [c.text.strip() for c in cols]
-                price = safe_float(prices_texts[0])
-
-                # ---- 修正：從 HTML class 判斷漲跌方向 ----
-                # Yahoo 用顏色 class 區分：紅色(#ff333a)=上漲，綠色(#459b16)=下跌
-                change_col = cols[2] if len(cols) > 2 else None
-                change_pct_raw = safe_float(prices_texts[2])
-                if change_col:
-                    col_html = str(change_col)
-                    if 'C(#ff333a)' in col_html:
-                        change_pct = abs(change_pct_raw)    # 上漲為正
-                    elif 'C(#459b16)' in col_html:
-                        change_pct = -abs(change_pct_raw)   # 下跌為負
+                    # 還原昨收，計算漲跌幅
+                    if "+" in sign_str:
+                        prev_close = close - diff_price
+                        change_pct = (diff_price / prev_close * 100) if prev_close > 0 else 0.0
+                    elif "-" in sign_str:
+                        prev_close = close + diff_price
+                        change_pct = -(diff_price / prev_close * 100) if prev_close > 0 else 0.0
                     else:
-                        change_pct = change_pct_raw         # 平盤
-                else:
-                    change_pct = change_pct_raw
-                # ---- 修正結束 ----
+                        change_pct = 0.0
 
-                turnover_str = prices_texts[-1]
-                if '億' in turnover_str: turnover = safe_float(turnover_str)
-                elif '萬' in turnover_str: turnover = safe_float(turnover_str) / 10000
-                else: turnover = safe_float(turnover_str)
-                
-                data.append([stock_id, stock_name, price, change_pct, turnover])
-            except Exception:
-                continue
-        return pd.DataFrame(data, columns=['股票代號', '股票名稱', '目前股價', '漲幅(%)', '成交金額(億)'])
+                    # 成交金額：單位為元，轉換成億
+                    turnover = safe_float(str(row[5]).replace(",", "")) / 1e8
+
+                    if stock_id in real_cb_ids:
+                        stock_name = f"{stock_name} (CB)"
+
+                    data.append([stock_id, stock_name, close, round(change_pct, 2), round(turnover, 2)])
+                except Exception:
+                    continue
     except Exception as e:
+        st.sidebar.warning(f"⚠️ 證交所 API 異常: {e}")
+
+    # ======================================================
+    # 來源 2：櫃買中心 (上櫃) — 每日成交資訊
+    # 欄位說明 (st41):
+    #   row[0]=代號, row[1]=名稱, row[2]=收盤,
+    #   row[3]=漲跌(帶符號字串，如 +1.50 / -2.00),
+    #   row[4]=開盤, row[5]=最高, row[6]=最低,
+    #   row[7]=成交股數, row[8]=成交金額(元), row[9]=成交筆數
+    # ======================================================
+    try:
+        tpex_url = (
+            "https://www.tpex.org.tw/web/stock/aftertrading/daily_trading_info/"
+            "st41_result.php?l=zh-tw&o=json&_=" + str(int(time.time() * 1000))
+        )
+        res2 = requests.get(tpex_url, headers=headers, timeout=15)
+        res2.raise_for_status()
+        j2 = res2.json()
+        if "aaData" in j2:
+            for row in j2["aaData"]:
+                try:
+                    stock_id   = str(row[0]).strip()
+                    stock_name = str(row[1]).strip()
+                    close      = safe_float(str(row[2]).replace(",", ""))
+                    diff_raw   = str(row[3]).replace(",", "").strip()  # e.g. "+1.50" or "-2.00"
+                    diff_price = safe_float(diff_raw)  # safe_float 拿掉符號，只留數字
+
+                    # 用原始字串判斷正負
+                    if diff_raw.startswith("+") or (diff_price > 0 and not diff_raw.startswith("-")):
+                        prev_close = close - diff_price
+                        change_pct = (diff_price / prev_close * 100) if prev_close > 0 else 0.0
+                    elif diff_raw.startswith("-"):
+                        prev_close = close + diff_price
+                        change_pct = -(diff_price / prev_close * 100) if prev_close > 0 else 0.0
+                    else:
+                        change_pct = 0.0
+
+                    # 成交金額：單位為元，轉換成億
+                    turnover = safe_float(str(row[8]).replace(",", "")) / 1e8
+
+                    if stock_id in real_cb_ids:
+                        stock_name = f"{stock_name} (CB)"
+
+                    data.append([stock_id, stock_name, close, round(change_pct, 2), round(turnover, 2)])
+                except Exception:
+                    continue
+    except Exception as e:
+        st.sidebar.warning(f"⚠️ 櫃買中心 API 異常: {e}")
+
+    if not data:
         return pd.DataFrame(columns=['股票代號', '股票名稱', '目前股價', '漲幅(%)', '成交金額(億)'])
+
+    df = pd.DataFrame(data, columns=['股票代號', '股票名稱', '目前股價', '漲幅(%)', '成交金額(億)'])
+    # 去除重複代號，依成交金額排序取 TOP30
+    df = df.drop_duplicates(subset='股票代號')
+    df = df.sort_values(by='成交金額(億)', ascending=False).head(30).reset_index(drop=True)
+    return df
 
 def update_and_load_history(df_current):
     """雲端儲存邏輯"""
     today_str = datetime.now(tw_tz).strftime('%Y-%m-%d')
     df_current_save = df_current.copy() if not df_current.empty else pd.DataFrame()
-    
+
     if not df_current_save.empty:
         df_current_save['日期'] = today_str
         df_current_save['股票代號'] = df_current_save['股票代號'].astype(str)
@@ -157,27 +208,28 @@ def update_and_load_history(df_current):
             gc = gspread.authorize(creds)
             sh = gc.open_by_url(GOOGLE_SHEET_URL)
             worksheet = sh.sheet1
-            
+
             records = worksheet.get_all_records()
-            df_hist = pd.DataFrame(records) if records else pd.DataFrame(columns=['股票代號', '股票名稱', '目前股價', '漲幅(%)', '成交金額(億)', '日期'])
-            
+            df_hist = pd.DataFrame(records) if records else pd.DataFrame(
+                columns=['股票代號', '股票名稱', '目前股價', '漲幅(%)', '成交金額(億)', '日期'])
+
             if not df_hist.empty and '股票代號' in df_hist.columns:
                 df_hist['股票代號'] = df_hist['股票代號'].astype(str)
-            
+
             if not df_current_save.empty and IS_VALID_TRADING_DAY:
                 if not df_hist.empty and '日期' in df_hist.columns:
                     df_hist = df_hist[df_hist['日期'] != today_str]
                 df_hist = pd.concat([df_hist, df_current_save], ignore_index=True)
-                
+
                 data_to_upload = [df_hist.columns.values.tolist()] + df_hist.values.tolist()
                 worksheet.clear()
                 worksheet.update(values=data_to_upload, range_name='A1')
-                
+
             return df_hist
-            
+
     except Exception as e:
         st.sidebar.error(f"❌ Google Sheets 連線失敗: {e}")
-        
+
     return pd.DataFrame()
 
 # ----------------- 樣式處理區塊 -----------------
@@ -187,78 +239,77 @@ def style_realtime_dataframe(df, prev_day_set):
         styles = [''] * len(row)
         change_idx = df.columns.get_loc('漲幅(%)')
         if row['漲幅(%)'] > 0:
-            styles[change_idx] = 'color: #ff4b4b; font-weight: bold;' 
+            styles[change_idx] = 'color: #ff4b4b; font-weight: bold;'
         elif row['漲幅(%)'] < 0:
-            styles[change_idx] = 'color: #00fa9a; font-weight: bold;' 
-            
+            styles[change_idx] = 'color: #00fa9a; font-weight: bold;'
+
         if len(prev_day_set) > 0 and str(row['股票代號']) not in prev_day_set:
             styles = [s + 'background-color: rgba(255, 255, 0, 0.2);' for s in styles]
         return styles
 
-    return df.style.apply(row_style, axis=1)\
+    return df.style.apply(row_style, axis=1) \
                    .format({'目前股價': '{:.2f}', '漲幅(%)': '{:+.2f}', '成交金額(億)': '{:.2f}'})
 
-# [修正]: 傳入 real_cb_ids 來動態補上歷史資料的 CB 標籤
+
 def create_5days_history_styler(df_hist, real_cb_ids):
     dates = sorted(df_hist['日期'].unique())
-    recent_dates = dates[-5:] 
-    
+    recent_dates = dates[-5:]
+
     display_dict = {}
     style_dict = {}
 
     for i, current_date in enumerate(recent_dates):
         df_day = df_hist[df_hist['日期'] == current_date].copy()
         df_day = df_day.sort_values(by='成交金額(億)', ascending=False).head(30).reset_index(drop=True)
-        
+
         up_count = len(df_day[df_day['漲幅(%)'] > 0])
         up_ratio = (up_count / len(df_day)) * 100 if len(df_day) > 0 else 0
         col_header = f"{current_date} (上漲 {up_ratio:.0f}%)"
-        
+
         prev_day_set = set()
         if i > 0:
-            prev_date = recent_dates[i-1]
+            prev_date = recent_dates[i - 1]
             prev_day_set = set(df_hist[df_hist['日期'] == prev_date]['股票代號'].astype(str))
         else:
             prev_idx = dates.index(current_date) - 1
             if prev_idx >= 0:
                 prev_date = dates[prev_idx]
                 prev_day_set = set(df_hist[df_hist['日期'] == prev_date]['股票代號'].astype(str))
-                
+
         col_display = []
         col_style = []
-        
+
         for _, row in df_day.iterrows():
             name = str(row['股票名稱'])
             stock_id = str(row['股票代號'])
             change = row['漲幅(%)']
-            
-            # [修正]: 動態為歷史資料補上 (CB) 標記，並防止重複標記
+
             if stock_id in real_cb_ids and "(CB)" not in name:
                 name = f"{name} (CB)"
-                
+
             col_display.append(name)
-            
+
             css = "text-align: center; "
             if change > 0:
                 css += "color: #ff4b4b; font-weight: bold; "
             elif change < 0:
                 css += "color: #00fa9a; font-weight: bold; "
-                
+
             if str(row['股票代號']) not in prev_day_set and len(prev_day_set) > 0:
                 css += "background-color: rgba(255, 255, 0, 0.2); "
-                
+
             col_style.append(css)
-            
+
         while len(col_display) < 30:
             col_display.append("")
             col_style.append("")
-            
+
         display_dict[col_header] = col_display
         style_dict[col_header] = col_style
 
     df_display = pd.DataFrame(display_dict)
     if not df_display.empty:
-        df_display.index = [f"第 {idx} 名" for idx in range(1, 31)] 
+        df_display.index = [f"第 {idx} 名" for idx in range(1, 31)]
     df_style = pd.DataFrame(style_dict, index=df_display.index)
 
     return df_display.style.apply(lambda _: df_style, axis=None)
@@ -284,13 +335,13 @@ else:
 current_time_str = datetime.now(tw_tz).strftime('%H:%M:%S')
 
 today_str = datetime.now(tw_tz).strftime('%Y-%m-%d')
-display_date_str = today_str 
+display_date_str = today_str
 yesterday_set = set()
 latest_past_date = "無紀錄"
 
 if not df_history_all.empty and '日期' in df_history_all.columns:
     all_dates = sorted(df_history_all['日期'].unique())
-    
+
     if IS_VALID_TRADING_DAY:
         past_dates = [d for d in all_dates if d < today_str]
         if past_dates:
@@ -302,7 +353,7 @@ if not df_history_all.empty and '日期' in df_history_all.columns:
             df_current_top30 = df_history_all[df_history_all['日期'] == display_date_str].copy()
             if '日期' in df_current_top30.columns:
                 df_current_top30 = df_current_top30.drop(columns=['日期'])
-            
+
             if len(all_dates) >= 2:
                 latest_past_date = all_dates[-2]
                 yesterday_set = set(df_history_all[df_history_all['日期'] == latest_past_date]['股票代號'].astype(str))
@@ -321,10 +372,10 @@ with tab1:
             st.rerun()
 
     if not df_current_top30.empty:
-        up_count = len(df_current_top30[df_current_top30['漲幅(%)'] > 0])
+        up_count   = len(df_current_top30[df_current_top30['漲幅(%)'] > 0])
         down_count = len(df_current_top30[df_current_top30['漲幅(%)'] < 0])
         flat_count = len(df_current_top30[df_current_top30['漲幅(%)'] == 0])
-        up_ratio = (up_count / len(df_current_top30)) * 100 if len(df_current_top30) > 0 else 0
+        up_ratio   = (up_count / len(df_current_top30)) * 100 if len(df_current_top30) > 0 else 0
 
         col1, col2, col3, col4 = st.columns(4)
         col1.metric("🔝 TOP30 上漲檔數", f"{up_count} 檔")
@@ -337,7 +388,7 @@ with tab1:
             st.subheader(f"📊 今日即時排行榜 (最後更新: {current_time_str})")
         else:
             st.subheader(f"📊 最近交易日 ({display_date_str}) 排行榜 (非交易時段)")
-            
+
         st.info(f"💡 整列顯示**黃色底色**代表與 **前一個開盤日 ({latest_past_date})** 相比的新進榜股票。名字後方帶有 **(CB)** 標籤代表具備可轉債題材。")
 
         styled_df = style_realtime_dataframe(df_current_top30, yesterday_set)
@@ -349,9 +400,8 @@ with tab1:
 with tab2:
     st.subheader("📅 近 5 日成交金額 TOP30 資金輪動表")
     st.caption("說明：此表僅顯示股票名稱。**紅色**為當日上漲，**綠色**為當日下跌，**黃底**為新進榜股票。帶有 **(CB)** 代表具可轉債題材。")
-    
+
     if not df_history_all.empty:
-        # [修正]: 抓取最新的 CB 名單，並傳入歷史圖表函式中進行比對
         real_cb_ids = get_real_cb_stock_ids()
         styled_hist_df = create_5days_history_styler(df_history_all, real_cb_ids)
         st.dataframe(styled_hist_df, use_container_width=True, height=1100)
@@ -360,5 +410,5 @@ with tab2:
 
 # ==================== 自動更新邏輯 ====================
 if 'auto_refresh' in st.session_state and st.session_state.auto_refresh:
-    time.sleep(180) 
+    time.sleep(180)
     st.rerun()
