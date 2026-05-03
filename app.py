@@ -407,61 +407,68 @@ def _fm_revenue(dataset: str, params: dict) -> list:
     return []
 
 
-@st.cache_data(ttl=7200, show_spinner=False)   # cache 2 小時
-def fetch_revenue_yoy(codes: list) -> dict:
-    """
-    取最新月營收年增率 (YoY%) 與是否創歷史新高。
-    回傳 {code: {"yoy": float, "is_high": bool}}
-
-    使用 FinMind TaiwanStockMonthRevenue：
-      - 無 token 也可查詢（免費額度）
-      - 不帶 data_id 一次抓全市場最近 14 個月資料
-    """
-    result  = {}
-    start   = (datetime.now() - timedelta(days=430)).strftime("%Y-%m-%d")
-
-    # 不帶 data_id → 全市場；FinMind 免費版支援
-    # 策略：逐股查詢，每支抓近 14 個月，最多查 30 支
-    # FinMind 免費版每小時 600 次，每支一次請求，不超限
-    for code in codes[:30]:
-        code_str = str(code).strip()
-        data = _fm_revenue("TaiwanStockMonthRevenue",
-                           {"data_id": code_str, "start_date": start})
-        if not data:
-            continue
-
+def _calc_yoy(data: list) -> dict:
+    """從 FinMind 月營收 data list 計算單一股票的 YoY 和創高"""
+    if not data:
+        return {}
+    try:
         df = pd.DataFrame(data)
         if not {"stock_id", "revenue", "date"}.issubset(df.columns):
-            continue
-
+            return {}
         df["date"]    = pd.to_datetime(df["date"])
         df["revenue"] = pd.to_numeric(df["revenue"], errors="coerce").fillna(0)
         df = df.sort_values("date").reset_index(drop=True)
-
         if len(df) < 2:
-            continue
-
-        latest_rev = df["revenue"].iloc[-1]
+            return {}
+        latest_rev = float(df["revenue"].iloc[-1])
         if latest_rev <= 0:
-            continue
-
-        # 去年同月（找 date 差距最接近 12 個月的那筆）
+            return {}
         latest_dt = df["date"].iloc[-1]
         target_dt = latest_dt - pd.DateOffset(months=12)
         df["dt_diff"] = (df["date"] - target_dt).abs()
-        prev_row = df.loc[df["dt_diff"].idxmin()]
+        prev_row  = df.loc[df["dt_diff"].idxmin()]
         if prev_row["dt_diff"] > pd.Timedelta(days=45):
-            continue
-        prev_rev = prev_row["revenue"]
+            return {}
+        prev_rev = float(prev_row["revenue"])
         if prev_rev <= 0:
-            continue
-
+            return {}
         yoy     = round((latest_rev - prev_rev) / prev_rev * 100, 1)
-        # 創歷史新高 = 最新月 >= 本資料集所有月份最高值
-        is_high = bool(latest_rev >= df["revenue"].max())
+        is_high = bool(latest_rev >= float(df["revenue"].max()))
+        return {"yoy": yoy, "is_high": is_high}
+    except Exception:
+        return {}
 
-        result[code_str] = {"yoy": yoy, "is_high": is_high}
-        time.sleep(0.05)   # 避免過快
+
+# cache key 用 tuple 而非 list（list 不能 hash）
+@st.cache_data(ttl=7200, show_spinner=False)
+def fetch_revenue_yoy(codes_tuple: tuple) -> dict:
+    """
+    取月營收年增率。參數必須是 tuple（list 無法被 cache hash）。
+    呼叫方式：fetch_revenue_yoy(tuple(df["code"].tolist()))
+    """
+    result = {}
+    token  = _read_token()
+    start  = (datetime.now() - timedelta(days=430)).strftime("%Y-%m-%d")
+
+    for code in codes_tuple[:30]:
+        code_str = str(code).strip()
+        if not re.match(r"^\d{4}$", code_str):
+            continue
+        params = {"dataset": "TaiwanStockMonthRevenue",
+                  "data_id": code_str, "start_date": start}
+        if token:
+            params["token"] = token
+        try:
+            r   = requests.get("https://api.finmindtrade.com/api/v4/data",
+                               params=params, timeout=20)
+            raw = r.json()
+            if int(str(raw.get("status", 0))) == 200:
+                info = _calc_yoy(raw.get("data") or [])
+                if info:
+                    result[code_str] = info
+        except Exception:
+            pass
+        time.sleep(0.08)
 
     return result
 
@@ -772,7 +779,7 @@ def page_realtime():
         save_today(client, df, today_k)
 
     with st.spinner("載入月營收資料…"):
-        rev_map = fetch_revenue_yoy(df["code"].tolist())
+        rev_map = fetch_revenue_yoy(tuple(df["code"].astype(str).tolist()))
 
     render_kpi(df, prev_codes, cb_codes)
     render_legend()
@@ -830,7 +837,7 @@ def page_history():
             with st.expander(f"📅 {date}", expanded=(date==sorted(selected,reverse=True)[0])):
                 render_kpi(df, prev_c, cb_codes)
                 render_legend()
-                rev_map = fetch_revenue_yoy(df["code"].tolist())
+                rev_map = fetch_revenue_yoy(tuple(df["code"].astype(str).tolist()))
                 st.dataframe(build_table(df, prev_c, cb_codes, revenue_map=rev_map),
                              use_container_width=True, height=600, hide_index=True)
 
@@ -863,7 +870,7 @@ def page_history():
                     unsafe_allow_html=True)
         render_legend()
         extra=[("avg_val","平均成交(億)"),("total_val","累積成交(億)"),("days","上榜天數")]
-        rev_map = fetch_revenue_yoy(agg["code"].tolist())
+        rev_map = fetch_revenue_yoy(tuple(agg["code"].astype(str).tolist()))
         st.dataframe(build_table(agg, prev_c, cb_codes, extra=extra, revenue_map=rev_map),
                      use_container_width=True, height=700, hide_index=True)
 
