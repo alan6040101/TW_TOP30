@@ -9,6 +9,7 @@
 import streamlit as st
 import pandas as pd
 import yfinance as yf
+import requests
 import re
 import time
 from datetime import datetime, timedelta, timezone
