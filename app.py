@@ -117,102 +117,42 @@ STOCK_POOL = {
 # 整理成乾淨的 dict (去掉 key 打錯的)
 STOCK_POOL = {k:v for k,v in STOCK_POOL.items() if re.match(r"^\d{4}$", str(k))}
 
-# CB 可轉債
-# 來源1: TWSE 官方 CB_OVERVIEW（不需 auth，最可靠）
-# 來源2: FinMind TaiwanStockConvertibleBond（需 token）
-# 來源3: thefew.tw/cb（爬蟲）
-# 若三者均失敗：回傳空集合（不標錯誤的 CB）
+# CB 可轉債：只用 FinMind（TWSE SSL 被 Streamlit Cloud 封，thefew.tw 無靜態資料）
 @st.cache_data(ttl=3600, show_spinner=False)
 def fetch_cb_stocks() -> tuple:
     """回傳 (codes_set, source_label)"""
-    hdrs = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/124",
-        "Referer":    "https://www.twse.com.tw/",
-        "Accept":     "application/json",
-    }
+    token = _read_token()
+    if not token:
+        return set(), "無Token"
 
-    # ── 來源1: TWSE CB_OVERVIEW ──
-    for url in [
-        "https://www.twse.com.tw/rwd/zh/cbInfo/CB_OVERVIEW",
-        "https://www.twse.com.tw/rwd/zh/cbInfo/CB_BOND_INFO",
-    ]:
-        try:
-            r   = requests.get(url, headers=hdrs, timeout=15)
-            raw = r.json()
-            if raw.get("stat") == "OK" and raw.get("data"):
-                codes = set()
-                fields = raw.get("fields", [])
-                # 找股票代號欄的 index
-                idx = None
-                for i, f in enumerate(fields):
-                    if any(k in str(f) for k in ["股票代號","標的","證券代號","underlying"]):
-                        idx = i; break
-                for row in raw["data"]:
-                    try:
-                        # 優先用找到的欄，否則掃所有欄
-                        candidates = [row[idx]] if idx is not None else row
-                        for cell in (candidates if isinstance(candidates, list) else [candidates]):
-                            s = str(cell).strip()
-                            if re.match(r"^\d{4}$", s):
-                                codes.add(s)
-                    except Exception:
-                        pass
-                if len(codes) >= 5:
-                    return codes, f"TWSE ({url.split('/')[-1]})"
-        except Exception:
-            pass
-
-    # ── 來源2: FinMind TaiwanStockConvertibleBond ──
     try:
-        token  = _read_token()
-        params = {"dataset": "TaiwanStockConvertibleBond"}
-        if token:
-            params["token"] = token
+        # FinMind TaiwanStockConvertibleBond — 取目前仍在流通的可轉債
+        params = {"dataset": "TaiwanStockConvertibleBond", "token": token}
         r   = requests.get("https://api.finmindtrade.com/api/v4/data",
                            params=params, timeout=15)
         raw = r.json()
         if int(str(raw.get("status", 0))) == 200 and raw.get("data"):
             df   = pd.DataFrame(raw["data"])
-            id_c = next((c for c in df.columns if "stock_id" in c.lower()), None)
-            if id_c:
+            # 欄位中找股票代號欄
+            id_c = next((c for c in df.columns
+                         if c.lower() in ("stock_id","stockid","stock_code","underlying_stock_id")),
+                        None)
+            if id_c is None:
+                # fallback: 掃所有欄找 4 碼數字
+                codes = set()
+                for col in df.columns:
+                    for v in df[col].astype(str):
+                        if re.match(r"^\d{4}$", v.strip()):
+                            codes.add(v.strip())
+            else:
                 codes = {str(v).strip() for v in df[id_c]
                          if re.match(r"^\d{4}$", str(v).strip())}
-                if len(codes) >= 5:
-                    return codes, "FinMind CB"
-    except Exception:
-        pass
-
-    # ── 來源3: thefew.tw/cb ──
-    try:
-        import json as _json
-        from bs4 import BeautifulSoup
-        r    = requests.get("https://thefew.tw/cb", headers={
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/124",
-            "Accept": "text/html,application/xhtml+xml;q=0.9,*/*;q=0.8",
-        }, timeout=15)
-        soup = BeautifulSoup(r.text, "html.parser")
-        codes = set()
-        tag   = soup.find("script", {"id": "__NEXT_DATA__"})
-        if tag:
-            def _dig(o):
-                if isinstance(o, dict):
-                    for k, v in o.items():
-                        if k.lower() in ("stock_id","stockid","code","股票代號"):
-                            s = str(v).strip()
-                            if re.match(r"^\d{4}$", s): codes.add(s)
-                        _dig(v)
-                elif isinstance(o, list):
-                    for i in o: _dig(i)
-                elif isinstance(o, str) and re.match(r"^\d{4}$", o.strip()):
-                    codes.add(o.strip())
-            _dig(_json.loads(tag.string))
-        if len(codes) >= 5:
-            return codes, "thefew.tw"
-    except Exception:
-        pass
-
-    # 所有來源失敗 → 回傳空集合（不誤標）
-    return set(), "無法取得CB資料"
+            if codes:
+                return codes, f"FinMind ({len(codes)} 支)"
+        else:
+            return set(), f"FinMind 回傳 status={raw.get('status')} msg={raw.get('msg','')}"
+    except Exception as e:
+        return set(), f"FinMind 例外: {e}"
 
 # ─────────────────────────────────────────────────────────────────────────────
 # TIME — 台灣時間 UTC+8
@@ -419,12 +359,16 @@ def _fm_revenue(dataset: str, params: dict) -> list:
 
 
 def _calc_yoy(data: list) -> dict:
-    """從 FinMind 月營收 data list 計算單一股票的 YoY 和創高"""
+    """
+    從 FinMind TaiwanStockMonthRevenue data list 計算 YoY 和創高。
+    欄位: date(YYYY-MM-DD), stock_id, revenue(千元), revenue_month, revenue_year
+    """
     if not data:
         return {}
     try:
         df = pd.DataFrame(data)
-        if not {"stock_id", "revenue", "date"}.issubset(df.columns):
+        # 確認必要欄位存在
+        if "revenue" not in df.columns or "date" not in df.columns:
             return {}
         df["date"]    = pd.to_datetime(df["date"])
         df["revenue"] = pd.to_numeric(df["revenue"], errors="coerce").fillna(0)
@@ -434,44 +378,50 @@ def _calc_yoy(data: list) -> dict:
         latest_rev = float(df["revenue"].iloc[-1])
         if latest_rev <= 0:
             return {}
-        latest_dt = df["date"].iloc[-1]
-        target_dt = latest_dt - pd.DateOffset(months=12)
-        df["dt_diff"] = (df["date"] - target_dt).abs()
-        prev_row  = df.loc[df["dt_diff"].idxmin()]
-        if prev_row["dt_diff"] > pd.Timedelta(days=45):
+        # 去年同月：找 date 距今 12 個月前最近的一筆
+        latest_dt  = df["date"].iloc[-1]
+        target_dt  = latest_dt - pd.DateOffset(months=12)
+        df["_diff"] = (df["date"] - target_dt).abs()
+        prev_row   = df.loc[df["_diff"].idxmin()]
+        if prev_row["_diff"] > pd.Timedelta(days=45):
             return {}
         prev_rev = float(prev_row["revenue"])
         if prev_rev <= 0:
             return {}
         yoy     = round((latest_rev - prev_rev) / prev_rev * 100, 1)
+        # 創歷史新高：最新月 >= 本段資料所有月份最高值
         is_high = bool(latest_rev >= float(df["revenue"].max()))
         return {"yoy": yoy, "is_high": is_high}
     except Exception:
         return {}
 
 
-# cache key 用 tuple 而非 list（list 不能 hash）
 @st.cache_data(ttl=7200, show_spinner=False)
 def fetch_revenue_yoy(codes_tuple: tuple) -> dict:
     """
-    取月營收年增率。參數必須是 tuple（list 無法被 cache hash）。
-    呼叫方式：fetch_revenue_yoy(tuple(df["code"].tolist()))
+    取月營收年增率 YoY(%) 和是否創歷史新高。
+    使用 FinMind TaiwanStockMonthRevenue，逐股查詢。
+    參數必須是 tuple（list 無法被 st.cache_data hash）。
     """
     result = {}
     token  = _read_token()
-    start  = (datetime.now() - timedelta(days=430)).strftime("%Y-%m-%d")
+    if not token:
+        return result   # 無 token 無法查
+
+    start = (datetime.now() - timedelta(days=430)).strftime("%Y-%m-%d")
 
     for code in codes_tuple[:30]:
         code_str = str(code).strip()
         if not re.match(r"^\d{4}$", code_str):
             continue
-        params = {"dataset": "TaiwanStockMonthRevenue",
-                  "data_id": code_str, "start_date": start}
-        if token:
-            params["token"] = token
         try:
-            r   = requests.get("https://api.finmindtrade.com/api/v4/data",
-                               params=params, timeout=20)
+            r = requests.get(
+                "https://api.finmindtrade.com/api/v4/data",
+                params={"dataset": "TaiwanStockMonthRevenue",
+                        "data_id": code_str,
+                        "start_date": start,
+                        "token": token},
+                timeout=15)
             raw = r.json()
             if int(str(raw.get("status", 0))) == 200:
                 info = _calc_yoy(raw.get("data") or [])
@@ -479,7 +429,7 @@ def fetch_revenue_yoy(codes_tuple: tuple) -> dict:
                     result[code_str] = info
         except Exception:
             pass
-        time.sleep(0.08)
+        time.sleep(0.1)   # 避免超過 FinMind 速率限制
 
     return result
 
