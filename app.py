@@ -333,7 +333,11 @@ def load_history(client) -> dict:
 # TABLE — 排行 / 股票名稱 / 漲跌幅 / 成交金額(億)
 # ─────────────────────────────────────────────────────────────────────────────
 def build_table(df, prev_codes, cb_codes, extra=None):
-    rows, pcts, news = [], [], []
+    rows = []
+    # 記錄每列的 metadata 供 Styler 使用
+    pct_list  = []
+    new_list  = []
+
     for _, r in df.iterrows():
         code   = str(r["code"]).strip()
         pct    = float(r.get("change_pct") or 0)
@@ -341,41 +345,50 @@ def build_table(df, prev_codes, cb_codes, extra=None):
         has_cb = code in cb_codes
         tags   = (["★新"] if is_new else []) + (["CB"] if has_cb else [])
         name   = str(r["name"]) + ("  " + "  ".join(tags) if tags else "")
-        pstr   = (f"▲ {pct:.2f}%" if pct > 0 else f"▼ {abs(pct):.2f}%" if pct < 0 else "─")
-        row_d  = {"排行":int(r.get("rank",_+1)), "股票名稱":name,
-                  "漲跌幅":pstr, "成交金額(億)":float(r.get("trade_value",0))}
+
+        # 漲跌幅：只有非零才顯示，避免 yfinance 前後日相同導致誤判為 0
+        if abs(pct) >= 0.01:
+            pstr = f"▲ {pct:.2f}%" if pct > 0 else f"▼ {abs(pct):.2f}%"
+        else:
+            pstr = "─"
+
+        row_d = {
+            "排行":        int(r.get("rank", _+1)),
+            "股票名稱":    name,
+            "漲跌幅":      pstr,
+            "成交金額(億)": float(r.get("trade_value", 0)),
+        }
         if extra:
             for s, d2 in extra: row_d[d2] = r.get(s, "")
-        rows.append(row_d); pcts.append(pct); news.append(is_new)
 
-    disp = pd.DataFrame(rows)
-    disp["__p"] = pcts
-    disp["__n"] = news
+        rows.append(row_d)
+        pct_list.append(pct)
+        new_list.append(is_new)
 
-    # ── Pandas Styler: apply() 必須回傳完整 CSS 屬性字串 e.g. "background-color: #xxx" ──
-    def rbg(row):
-        if row["__n"]:      bg = "#191000"
-        elif row["__p"]>0:  bg = "#1a0808"
-        elif row["__p"]<0:  bg = "#041008"
-        else:               bg = "#0a1520"
-        return [f"background-color: {bg}"] * len(row)
+    # 只建立「顯示欄位」的 DataFrame，不放 __p/__n
+    vis_cols = ["排行", "股票名稱", "漲跌幅", "成交金額(億)"]
+    if extra:
+        vis_cols += [d2 for _, d2 in extra]
 
+    disp = pd.DataFrame(rows)[vis_cols]
+
+    # Styler apply 函式：必須回傳完整 CSS 屬性字串
     def cpct(col):
         result = []
-        for v in disp["__p"]:
-            if v > 0:   result.append("color: #e74c3c; font-weight: 600")
-            elif v < 0: result.append("color: #2ecc71; font-weight: 600")
-            else:       result.append("color: #5a6a80")
+        for v in pct_list:
+            if v > 0.01:    result.append("color: #e74c3c; font-weight: 600")
+            elif v < -0.01: result.append("color: #2ecc71; font-weight: 600")
+            else:           result.append("color: #5a6a80")
         return result
 
     def cname(col):
         result = []
         for i, v in enumerate(disp["股票名稱"]):
-            n  = disp["__n"].iloc[i]
-            cb = "CB" in str(v)
-            if n:    result.append("color: #f39c12; font-weight: 700")
-            elif cb: result.append("color: #a78bfa")
-            else:    result.append("color: #c8d6e5")
+            is_n = new_list[i]
+            cb   = "CB" in str(v)
+            if is_n:  result.append("color: #f39c12; font-weight: 700")
+            elif cb:  result.append("color: #a78bfa")
+            else:     result.append("color: #c8d6e5")
         return result
 
     def crank(col):
@@ -389,16 +402,15 @@ def build_table(df, prev_codes, cb_codes, extra=None):
 
     return (
         disp.style
-        .apply(rbg,   axis=1)
         .apply(cpct,  subset=["漲跌幅"])
         .apply(cname, subset=["股票名稱"])
         .apply(crank, subset=["排行"])
         .format(fmt)
         .set_properties(**{"font-family": "IBM Plex Mono, monospace",
                            "font-size": "13px", "border": "none"})
-        .set_properties(subset=["排行"],                        **{"text-align": "center"})
-        .set_properties(subset=["股票名稱"],                     **{"text-align": "left"})
-        .set_properties(subset=["漲跌幅", "成交金額(億)"],       **{"text-align": "right"})
+        .set_properties(subset=["排行"],                   **{"text-align": "center"})
+        .set_properties(subset=["股票名稱"],                **{"text-align": "left"})
+        .set_properties(subset=["漲跌幅", "成交金額(億)"], **{"text-align": "right"})
         .set_table_styles([
             {"selector": "thead th", "props": [
                 ("background-color", "#0a1520"), ("color", "#4a6080"),
@@ -417,7 +429,6 @@ def build_table(df, prev_codes, cb_codes, extra=None):
             ]},
         ])
         .hide(axis="index")
-        .hide(subset=["__p", "__n"], axis="columns")
     )
 
 # ─────────────────────────────────────────────────────────────────────────────
