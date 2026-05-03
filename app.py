@@ -252,9 +252,20 @@ def _fm_stock_price(date_str: str) -> pd.DataFrame:
                 df["close"]       = pd.to_numeric(df["close"],  errors="coerce").fillna(0)
                 df["spread"]      = pd.to_numeric(df["spread"], errors="coerce").fillna(0)
                 df["prev_close"]  = df["close"] - df["spread"]
+                # spread 即漲跌價差（close - 昨收）；prev_close > 0 才計算
                 df["change_pct"]  = df.apply(
                     lambda r: round(r["spread"] / r["prev_close"] * 100, 2)
                     if r["prev_close"] > 0 else 0.0, axis=1)
+                # 若 spread=0 但 open != close，用 open 估算（極少數情況）
+                mask = (df["spread"] == 0) & (df["close"] != df.get("open", df["close"]))
+                if "open" in df.columns:
+                    df_open = pd.to_numeric(df["open"], errors="coerce").fillna(0)
+                    alt_prev = df_open  # open 近似昨收
+                    alt_chg  = df.apply(
+                        lambda r: round((r["close"] - float(df_open[r.name])) /
+                                        float(df_open[r.name]) * 100, 2)
+                        if float(df_open[r.name]) > 0 else 0.0, axis=1)
+                    df.loc[mask & (df_open > 0), "change_pct"] = alt_chg[mask & (df_open > 0)]
                 df = df[df["stock_id"].str.match(r"^\d{4}$") & (df["trade_value"] > 0)]
                 return df
     except Exception:
@@ -516,7 +527,7 @@ def build_table(df, prev_codes, cb_codes, extra=None, revenue_map=None):
         name      = prefix + base_name + suffix
 
         # 漲跌幅：只有非零才顯示，避免 yfinance 前後日相同導致誤判為 0
-        if abs(pct) >= 0.01:
+        if abs(pct) >= 0.005:
             pstr = f"▲ {pct:.2f}%" if pct > 0 else f"▼ {abs(pct):.2f}%"
         else:
             pstr = "─"
@@ -559,8 +570,8 @@ def build_table(df, prev_codes, cb_codes, extra=None, revenue_map=None):
     def cpct(col):
         result = []
         for v in pct_list:
-            if v > 0.01:    result.append("color: #e74c3c; font-weight: 600")
-            elif v < -0.01: result.append("color: #2ecc71; font-weight: 600")
+            if v > 0.005:    result.append("color: #e74c3c; font-weight: 600")
+            elif v < -0.005: result.append("color: #2ecc71; font-weight: 600")
             else:           result.append("color: #5a6a80")
         return result
 
