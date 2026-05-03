@@ -116,48 +116,91 @@ STOCK_POOL = {
 # 整理成乾淨的 dict (去掉 key 打錯的)
 STOCK_POOL = {k:v for k,v in STOCK_POOL.items() if re.match(r"^\d{4}$", str(k))}
 
-# CB 可轉債：從 thefew.tw/cb 動態爬取
+# CB 可轉債：
+#   主要來源 — FinMind TaiwanStockConvertibleBond（最準確）
+#   備援來源 — thefew.tw/cb HTML 解析（Next.js，需解析 __NEXT_DATA__ JSON）
+#   最終備援 — 內建靜態清單
 @st.cache_data(ttl=3600, show_spinner=False)
 def fetch_cb_stocks() -> set:
-    """
-    從 https://thefew.tw/cb 爬取目前有效可轉債對應的股票代號。
-    以 requests + BeautifulSoup 解析 HTML 表格中的 4 碼股票代號。
-    若爬取失敗則回傳內建備援清單。
-    """
     FALLBACK = {
-        "2330","2317","2454","3008","2382","2308","2303","6505","1301","1303",
-        "2002","2412","2881","2882","2886","2891","2884","2885","2890","2880",
-        "2892","6669","3231","2379","2395","2408","3034","2344","2357","4904",
-        "3045","2603","2609","2615","2618","2633","2801","2823","2838","2845",
-        "3481","3673","3702","4938","5871","5876","6176","6269","6278","6285",
-        "6443","6446","6456","6533","6547","6654","6770","2345","2353","2376",
-        "2392","2449","2474","2887","2888","2912","3706","5483","6271","2207",
+        "1101","1102","1216","1301","1303","1326","1402","1476","1477",
+        "2002","2049","2105","2204","2207","2301","2303","2308","2317",
+        "2325","2330","2344","2345","2353","2357","2376","2379","2382",
+        "2392","2395","2408","2412","2449","2451","2454","2474","2603",
+        "2609","2615","2618","2633","2801","2823","2838","2845","2880",
+        "2881","2882","2884","2885","2886","2887","2888","2890","2891",
+        "2892","2912","3008","3034","3231","3481","3673","3702","3706",
+        "4904","4938","4967","5483","5871","5876","6176","6269","6271",
+        "6278","6285","6415","6443","6446","6456","6533","6547","6654",
+        "6669","6770",
     }
+
+    # ── 來源1: FinMind TaiwanStockConvertibleBond ──
+    try:
+        token  = _read_token()
+        params = {"dataset": "TaiwanStockConvertibleBond"}
+        if token:
+            params["token"] = token
+        r    = requests.get("https://api.finmindtrade.com/api/v4/data",
+                            params=params, timeout=15)
+        raw  = r.json()
+        if int(str(raw.get("status", 0))) == 200 and raw.get("data"):
+            df   = pd.DataFrame(raw["data"])
+            id_c = next((c for c in df.columns if "stock_id" in c.lower()), None)
+            if id_c:
+                codes = {str(v).strip() for v in df[id_c]
+                         if re.match(r"^\d{4}$", str(v).strip())}
+                if len(codes) >= 10:
+                    return codes
+    except Exception:
+        pass
+
+    # ── 來源2: thefew.tw/cb — Next.js SPA，資料在 __NEXT_DATA__ JSON 裡 ──
     try:
         from bs4 import BeautifulSoup
+        import json as _json
         headers = {
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
-            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-            "Accept-Language": "zh-TW,zh;q=0.9",
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/124",
+            "Accept": "text/html,application/xhtml+xml;q=0.9,*/*;q=0.8",
+            "Accept-Language": "zh-TW,zh;q=0.9,en;q=0.7",
+            "Referer": "https://thefew.tw/",
         }
-        r = requests.get("https://thefew.tw/cb", headers=headers, timeout=15)
+        r    = requests.get("https://thefew.tw/cb", headers=headers, timeout=15)
         soup = BeautifulSoup(r.text, "html.parser")
         codes = set()
-        # 搜尋所有 4 碼數字（股票代號格式）
-        for text in soup.stripped_strings:
-            t = text.strip()
-            if re.match(r"^\d{4}$", t):
-                codes.add(t)
-        # 也掃 href、data 屬性
+
+        # Next.js 把資料嵌在 <script id="__NEXT_DATA__"> 裡
+        next_data = soup.find("script", {"id": "__NEXT_DATA__"})
+        if next_data:
+            data = _json.loads(next_data.string)
+            # 遞迴搜尋所有 4 碼數字
+            def _find_codes(obj, found):
+                if isinstance(obj, dict):
+                    for k, v in obj.items():
+                        if k.lower() in ("stock_id","stockid","code","股票代號","id"):
+                            s = str(v).strip()
+                            if re.match(r"^\d{4}$", s):
+                                found.add(s)
+                        _find_codes(v, found)
+                elif isinstance(obj, list):
+                    for item in obj:
+                        _find_codes(item, found)
+                elif isinstance(obj, str) and re.match(r"^\d{4}$", obj.strip()):
+                    found.add(obj.strip())
+            _find_codes(data, codes)
+
+        # 也掃 HTML 中明確的 data-stock、data-id 屬性（排除年份等）
         for tag in soup.find_all(True):
-            for attr in ["href","data-id","data-code","id","value"]:
-                val = tag.get(attr,"")
-                if re.match(r"^\d{4}$", str(val).strip()):
-                    codes.add(str(val).strip())
-        if len(codes) >= 10:   # 至少抓到 10 支才視為成功
+            for attr in ["data-stock","data-stock-id","data-code","data-id"]:
+                val = str(tag.get(attr, "")).strip()
+                if re.match(r"^\d{4}$", val):
+                    codes.add(val)
+
+        if len(codes) >= 10:
             return codes
     except Exception:
         pass
+
     return FALLBACK
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -352,43 +395,47 @@ def fetch_revenue_yoy(codes: list) -> dict:
     start   = (datetime.now() - timedelta(days=430)).strftime("%Y-%m-%d")
 
     # 不帶 data_id → 全市場；FinMind 免費版支援
-    data = _fm_revenue("TaiwanStockMonthRevenue", {"start_date": start})
-
-    if not data:
-        return result
-
-    df = pd.DataFrame(data)
-    if not {"stock_id", "revenue", "date"}.issubset(df.columns):
-        return result
-
-    df["date"]     = pd.to_datetime(df["date"])
-    df["revenue"]  = pd.to_numeric(df["revenue"], errors="coerce").fillna(0)
-    df["stock_id"] = df["stock_id"].astype(str).str.strip()
-
-    code_set = set(str(c) for c in codes)
-    df = df[df["stock_id"].isin(code_set)]
-
-    for code in codes:
-        code = str(code)
-        sub  = df[df["stock_id"] == code].sort_values("date").reset_index(drop=True)
-        if len(sub) < 13:   # 需至少 13 個月才能算 YoY
+    # 策略：逐股查詢，每支抓近 14 個月，最多查 30 支
+    # FinMind 免費版每小時 600 次，每支一次請求，不超限
+    for code in codes[:30]:
+        code_str = str(code).strip()
+        data = _fm_revenue("TaiwanStockMonthRevenue",
+                           {"data_id": code_str, "start_date": start})
+        if not data:
             continue
 
-        latest_rev = sub["revenue"].iloc[-1]
-        latest_dt  = sub["date"].iloc[-1]
+        df = pd.DataFrame(data)
+        if not {"stock_id", "revenue", "date"}.issubset(df.columns):
+            continue
+
+        df["date"]    = pd.to_datetime(df["date"])
+        df["revenue"] = pd.to_numeric(df["revenue"], errors="coerce").fillna(0)
+        df = df.sort_values("date").reset_index(drop=True)
+
+        if len(df) < 2:
+            continue
+
+        latest_rev = df["revenue"].iloc[-1]
         if latest_rev <= 0:
             continue
 
-        # 去年同月（前 12 筆）
-        prev_rev = sub["revenue"].iloc[-13]
+        # 去年同月（找 date 差距最接近 12 個月的那筆）
+        latest_dt = df["date"].iloc[-1]
+        target_dt = latest_dt - pd.DateOffset(months=12)
+        df["dt_diff"] = (df["date"] - target_dt).abs()
+        prev_row = df.loc[df["dt_diff"].idxmin()]
+        if prev_row["dt_diff"] > pd.Timedelta(days=45):
+            continue
+        prev_rev = prev_row["revenue"]
         if prev_rev <= 0:
             continue
 
         yoy     = round((latest_rev - prev_rev) / prev_rev * 100, 1)
-        # 創歷史新高 = 最新月 >= 本資料集中所有月份最高值
-        is_high = bool(latest_rev >= sub["revenue"].max())
+        # 創歷史新高 = 最新月 >= 本資料集所有月份最高值
+        is_high = bool(latest_rev >= df["revenue"].max())
 
-        result[code] = {"yoy": yoy, "is_high": is_high}
+        result[code_str] = {"yoy": yoy, "is_high": is_high}
+        time.sleep(0.05)   # 避免過快
 
     return result
 
