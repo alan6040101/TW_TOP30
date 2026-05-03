@@ -116,17 +116,49 @@ STOCK_POOL = {
 # 整理成乾淨的 dict (去掉 key 打錯的)
 STOCK_POOL = {k:v for k,v in STOCK_POOL.items() if re.match(r"^\d{4}$", str(k))}
 
-# CB 已發行可轉債靜態清單（定期更新）
-CB_STOCKS = {
-    "2330","2317","2454","3008","2382","2308","2303","6505","1301","1303",
-    "2002","2412","2881","2882","2886","2891","2884","2885","2890","2880",
-    "2892","6669","3231","2379","2395","2408","3034","2344","2357","4904",
-    "3045","2603","2609","2615","2618","2633","2801","2823","2834","2838",
-    "2845","3481","3673","3702","4938","4958","5871","5876","5880","6176",
-    "6269","6278","6285","6443","6446","6456","6533","6547","6654","6770",
-    "2345","2353","2356","2376","2392","2449","2451","2458","2474","2887",
-    "2888","2912","3706","5483","6271","2207","1101","1102","1301","1303",
-}
+# CB 可轉債：從 thefew.tw/cb 動態爬取
+@st.cache_data(ttl=3600, show_spinner=False)
+def fetch_cb_stocks() -> set:
+    """
+    從 https://thefew.tw/cb 爬取目前有效可轉債對應的股票代號。
+    以 requests + BeautifulSoup 解析 HTML 表格中的 4 碼股票代號。
+    若爬取失敗則回傳內建備援清單。
+    """
+    FALLBACK = {
+        "2330","2317","2454","3008","2382","2308","2303","6505","1301","1303",
+        "2002","2412","2881","2882","2886","2891","2884","2885","2890","2880",
+        "2892","6669","3231","2379","2395","2408","3034","2344","2357","4904",
+        "3045","2603","2609","2615","2618","2633","2801","2823","2838","2845",
+        "3481","3673","3702","4938","5871","5876","6176","6269","6278","6285",
+        "6443","6446","6456","6533","6547","6654","6770","2345","2353","2376",
+        "2392","2449","2474","2887","2888","2912","3706","5483","6271","2207",
+    }
+    try:
+        from bs4 import BeautifulSoup
+        headers = {
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+            "Accept-Language": "zh-TW,zh;q=0.9",
+        }
+        r = requests.get("https://thefew.tw/cb", headers=headers, timeout=15)
+        soup = BeautifulSoup(r.text, "html.parser")
+        codes = set()
+        # 搜尋所有 4 碼數字（股票代號格式）
+        for text in soup.stripped_strings:
+            t = text.strip()
+            if re.match(r"^\d{4}$", t):
+                codes.add(t)
+        # 也掃 href、data 屬性
+        for tag in soup.find_all(True):
+            for attr in ["href","data-id","data-code","id","value"]:
+                val = tag.get(attr,"")
+                if re.match(r"^\d{4}$", str(val).strip()):
+                    codes.add(str(val).strip())
+        if len(codes) >= 10:   # 至少抓到 10 支才視為成功
+            return codes
+    except Exception:
+        pass
+    return FALLBACK
 
 # ─────────────────────────────────────────────────────────────────────────────
 # TIME — 台灣時間 UTC+8
@@ -271,6 +303,95 @@ def fetch_realtime_top30() -> tuple:
         return pd.DataFrame(), f"即時資料例外: {e}"
 
 # ─────────────────────────────────────────────────────────────────────────────
+# 月營收年增率 + 創歷史新高
+# ─────────────────────────────────────────────────────────────────────────────
+def _read_finmind_token() -> str:
+    """讀取 FinMind token（支援多種 secrets 格式）"""
+    for k in ["finmind_token","FINMIND_TOKEN","finmind_api_token"]:
+        try:
+            v = st.secrets.get(k,"")
+            if v: return str(v).strip()
+        except: pass
+    try:
+        v = st.secrets.get("finmind",{}).get("token","")
+        if v: return str(v).strip()
+    except: pass
+    return ""
+
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def fetch_revenue_yoy(codes: list) -> dict:
+    """
+    取最新月營收年增率 (YoY%) 與是否創歷史新高。
+    回傳 {code: {"yoy": float, "is_high": bool}}
+
+    資料來源:
+      主要 — FinMind TaiwanStockMonthRevenue
+      備援 — 回傳空 dict (不顯示此欄)
+    """
+    result = {}
+    token  = _read_finmind_token()
+    if not token:
+        return result
+
+    from datetime import datetime, timedelta
+    # 抓近 13 個月資料（計算 YoY 需要去年同月）
+    start = (datetime.now() - timedelta(days=400)).strftime("%Y-%m-%d")
+
+    # FinMind 支援批次查詢，但 TaiwanStockMonthRevenue 需逐股或用 date 全撈
+    # 先嘗試不帶 data_id 撈最近一期全市場
+    try:
+        params = {
+            "dataset": "TaiwanStockMonthRevenue",
+            "start_date": start,
+            "token": token,
+        }
+        r    = requests.get("https://api.finmindtrade.com/api/v4/data",
+                            params=params, timeout=30)
+        raw  = r.json()
+        stat = int(str(raw.get("status", 0)))
+        if stat == 200 and raw.get("data"):
+            df = pd.DataFrame(raw["data"])
+            # 欄位: date, stock_id, country, revenue, revenue_month, revenue_year
+            # revenue = 當月營收(千元), date = YYYY-MM-DD
+            if {"stock_id","revenue","date"}.issubset(df.columns):
+                df["date"] = pd.to_datetime(df["date"])
+                df["revenue"] = pd.to_numeric(df["revenue"], errors="coerce").fillna(0)
+                df["stock_id"] = df["stock_id"].astype(str)
+
+                for code in codes:
+                    sub = df[df["stock_id"] == code].sort_values("date")
+                    if len(sub) < 2:
+                        continue
+                    # 最新月
+                    latest     = sub.iloc[-1]
+                    latest_rev = latest["revenue"]
+                    latest_dt  = latest["date"]
+
+                    # 去年同月 (±1個月容錯)
+                    target_dt  = latest_dt - pd.DateOffset(months=12)
+                    same_month = sub[
+                        (sub["date"] >= target_dt - pd.Timedelta(days=32)) &
+                        (sub["date"] <= target_dt + pd.Timedelta(days=32))
+                    ]
+                    if same_month.empty or same_month.iloc[-1]["revenue"] <= 0:
+                        continue
+                    prev_rev = same_month.iloc[-1]["revenue"]
+                    yoy      = round((latest_rev - prev_rev) / prev_rev * 100, 1)
+
+                    # 是否創歷史新高（近 12 個月最高）
+                    hist_max  = sub["revenue"].max()
+                    is_high   = (latest_rev >= hist_max) and (latest_rev > 0)
+
+                    result[code] = {"yoy": yoy, "is_high": is_high}
+                return result
+    except Exception:
+        pass
+
+    return result
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # GOOGLE SHEETS
 # ─────────────────────────────────────────────────────────────────────────────
 GOOGLE_SHEETS_ID = "1lTRxbT9iv3uRIrQ1wUFPV0LZbo8p5Qoh4a1FMGa-iU4"
@@ -332,19 +453,25 @@ def load_history(client) -> dict:
 # ─────────────────────────────────────────────────────────────────────────────
 # TABLE — 排行 / 股票名稱 / 漲跌幅 / 成交金額(億)
 # ─────────────────────────────────────────────────────────────────────────────
-def build_table(df, prev_codes, cb_codes, extra=None):
+def build_table(df, prev_codes, cb_codes, extra=None, revenue_map=None):
     rows = []
     # 記錄每列的 metadata 供 Styler 使用
     pct_list  = []
     new_list  = []
+    cb_list   = []
+    yoy_list  = []
+    high_list = []
 
     for _, r in df.iterrows():
         code   = str(r["code"]).strip()
         pct    = float(r.get("change_pct") or 0)
         is_new = bool(prev_codes) and (code not in prev_codes)
         has_cb = code in cb_codes
-        tags   = (["★新"] if is_new else []) + (["CB"] if has_cb else [])
-        name   = str(r["name"]) + ("  " + "  ".join(tags) if tags else "")
+        # ★ 前綴表示新上榜，CB 後綴表示可轉債
+        base_name = str(r["name"])
+        prefix    = "★ " if is_new else ""
+        suffix    = "  CB" if has_cb else ""
+        name      = prefix + base_name + suffix
 
         # 漲跌幅：只有非零才顯示，避免 yfinance 前後日相同導致誤判為 0
         if abs(pct) >= 0.01:
@@ -352,21 +479,35 @@ def build_table(df, prev_codes, cb_codes, extra=None):
         else:
             pstr = "─"
 
+        # 月營收年增率
+        rev_info  = (revenue_map or {}).get(code, {})
+        yoy       = rev_info.get("yoy", None)
+        is_high   = rev_info.get("is_high", False)
+        if yoy is not None:
+            rev_str = ("🔺創高 " if is_high else "") + f"{yoy:+.1f}%"
+        else:
+            rev_str = "—"
+
         row_d = {
             "排行":        int(r.get("rank", _+1)),
             "股票名稱":    name,
             "漲跌幅":      pstr,
             "成交金額(億)": float(r.get("trade_value", 0)),
+            "月營收YoY":   rev_str,
         }
+        # 記錄 yoy 數值供 Styler 著色
+        yoy_list.append(yoy if yoy is not None else 0)
+        high_list.append(is_high)
         if extra:
             for s, d2 in extra: row_d[d2] = r.get(s, "")
 
         rows.append(row_d)
         pct_list.append(pct)
         new_list.append(is_new)
+        cb_list.append(has_cb)
 
     # 只建立「顯示欄位」的 DataFrame，不放 __p/__n
-    vis_cols = ["排行", "股票名稱", "漲跌幅", "成交金額(億)"]
+    vis_cols = ["排行", "股票名稱", "漲跌幅", "成交金額(億)", "月營收YoY"]
     if extra:
         vis_cols += [d2 for _, d2 in extra]
 
@@ -383,9 +524,9 @@ def build_table(df, prev_codes, cb_codes, extra=None):
 
     def cname(col):
         result = []
-        for i, v in enumerate(disp["股票名稱"]):
+        for i in range(len(disp)):
             is_n = new_list[i]
-            cb   = "CB" in str(v)
+            cb   = cb_list[i]
             if is_n:  result.append("color: #f39c12; font-weight: 700")
             elif cb:  result.append("color: #a78bfa")
             else:     result.append("color: #c8d6e5")
@@ -400,17 +541,32 @@ def build_table(df, prev_codes, cb_codes, extra=None):
         for _, d2 in extra:
             if "億" in d2: fmt[d2] = "{:,.1f}"
 
+    def crev(col):
+        """月營收YoY 著色：正=橘紅，負=灰，創高=金色"""
+        result = []
+        for i in range(len(disp)):
+            if high_list[i]:
+                result.append("color: #f7b731; font-weight: 700")
+            elif yoy_list[i] > 0:
+                result.append("color: #e67e22")
+            elif yoy_list[i] < 0:
+                result.append("color: #7f8c8d")
+            else:
+                result.append("color: #5a6a80")
+        return result
+
     return (
         disp.style
         .apply(cpct,  subset=["漲跌幅"])
         .apply(cname, subset=["股票名稱"])
         .apply(crank, subset=["排行"])
+        .apply(crev,  subset=["月營收YoY"])
         .format(fmt)
         .set_properties(**{"font-family": "IBM Plex Mono, monospace",
                            "font-size": "13px", "border": "none"})
         .set_properties(subset=["排行"],                   **{"text-align": "center"})
         .set_properties(subset=["股票名稱"],                **{"text-align": "left"})
-        .set_properties(subset=["漲跌幅", "成交金額(億)"], **{"text-align": "right"})
+        .set_properties(subset=["漲跌幅", "成交金額(億)", "月營收YoY"], **{"text-align": "right"})
         .set_table_styles([
             {"selector": "thead th", "props": [
                 ("background-color", "#0a1520"), ("color", "#4a6080"),
@@ -533,12 +689,15 @@ def page_realtime():
         st.info("yfinance 偶爾會有延遲，請稍後點「立即刷新」重試。")
         return
 
-    cb_codes   = CB_STOCKS
+    cb_codes   = fetch_cb_stocks()
     client     = gs_client()
     prev_codes = load_prev_codes(client, today_k)
 
     if tw.hour >= 14:
         save_today(client, df, today_k)
+
+    with st.spinner("載入月營收資料…"):
+        rev_map = fetch_revenue_yoy(df["code"].tolist())
 
     render_kpi(df, prev_codes, cb_codes)
     render_legend()
@@ -547,7 +706,7 @@ def page_realtime():
         f'更新: {tw.strftime("%H:%M:%S")} &nbsp;·&nbsp; 每 3 分鐘自動刷新</div>',
         unsafe_allow_html=True)
 
-    st.dataframe(build_table(df, prev_codes, cb_codes),
+    st.dataframe(build_table(df, prev_codes, cb_codes, revenue_map=rev_map),
                  use_container_width=True, height=980, hide_index=True)
 
     if not open_:
@@ -567,7 +726,7 @@ def page_history():
 
     client   = gs_client()
     history  = load_history(client)
-    cb_codes = CB_STOCKS
+    cb_codes = fetch_cb_stocks()
 
     if not history:
         st.warning("尚無歷史資料。請確認 Google Sheets API 已設定，且系統曾在交易日 14:00 後儲存資料。")
@@ -596,7 +755,8 @@ def page_history():
             with st.expander(f"📅 {date}", expanded=(date==sorted(selected,reverse=True)[0])):
                 render_kpi(df, prev_c, cb_codes)
                 render_legend()
-                st.dataframe(build_table(df,prev_c,cb_codes),
+                rev_map = fetch_revenue_yoy(df["code"].tolist())
+                st.dataframe(build_table(df, prev_c, cb_codes, revenue_map=rev_map),
                              use_container_width=True, height=600, hide_index=True)
 
     else:
@@ -628,7 +788,8 @@ def page_history():
                     unsafe_allow_html=True)
         render_legend()
         extra=[("avg_val","平均成交(億)"),("total_val","累積成交(億)"),("days","上榜天數")]
-        st.dataframe(build_table(agg,prev_c,cb_codes,extra=extra),
+        rev_map = fetch_revenue_yoy(agg["code"].tolist())
+        st.dataframe(build_table(agg, prev_c, cb_codes, extra=extra, revenue_map=rev_map),
                      use_container_width=True, height=700, hide_index=True)
 
 # ─────────────────────────────────────────────────────────────────────────────
