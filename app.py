@@ -47,7 +47,7 @@ section[data-testid="stSidebarContent"] * { color:#c8d6e5 !important; }
 .blink { animation:blink 1.2s step-start infinite; }
 @keyframes blink { 50%{opacity:0;} }
 
-.kpi-strip { display:grid; grid-template-columns:repeat(4,1fr); gap:10px; margin-bottom:20px; }
+.kpi-strip { display:grid; grid-template-columns:repeat(3,1fr); gap:10px; margin-bottom:20px; }
 .kpi { background:#0a1520; border:1px solid #1a2940; border-radius:4px; padding:14px 18px; }
 .kpi-label { font-size:10px; color:#4a6080; letter-spacing:1.5px; text-transform:uppercase; margin-bottom:8px; }
 .kpi-value { font-family:'IBM Plex Mono',monospace; font-size:24px; font-weight:600; }
@@ -526,7 +526,7 @@ def build_table(df, prev_codes, cb_codes, extra=None, revenue_map=None):
         elif pct < 0:
             pstr = f"▼ {abs(pct):.2f}%"
         else:
-            pstr = "─"   # 真平盤：spread = 0
+            pstr = "-0.00%"   # 真平盤
 
         # 月營收年增率
         rev_info  = (revenue_map or {}).get(code, {})
@@ -568,7 +568,7 @@ def build_table(df, prev_codes, cb_codes, extra=None, revenue_map=None):
         for v in pct_list:
             if v > 0:    result.append("color: #e74c3c; font-weight: 600")
             elif v < 0:  result.append("color: #2ecc71; font-weight: 600")
-            else:           result.append("color: #5a6a80")
+            else:        result.append("color: #5a6a80")   # 平盤灰色
         return result
 
     def cname(col):
@@ -642,13 +642,16 @@ def build_table(df, prev_codes, cb_codes, extra=None, revenue_map=None):
 def render_kpi(df, prev_codes, cb_codes):
     up=int((df["change_pct"]>0).sum()); dn=int((df["change_pct"]<0).sum()); nc=len(df)-up-dn
     new_c=sum(1 for c in df["code"].astype(str) if prev_codes and c not in prev_codes)
-    cb_c =sum(1 for c in df["code"].astype(str) if c in cb_codes)
     tot=len(df) or 1; up_p=round(up/tot*100); dn_p=round(dn/tot*100); nc_p=100-up_p-dn_p
     st.markdown(f"""
     <div class="kpi-strip">
         <div class="kpi"><div class="kpi-label">上榜股數</div>
             <div class="kpi-value" style="color:#4fc3f7">{tot}</div></div>
-        <div class="kpi"><div class="kpi-label">漲 / 平 / 跌</div>
+        <div class="kpi">
+            <div class="kpi-label" style="display:flex;justify-content:space-between;align-items:center">
+                <span>漲 / 平 / 跌</span>
+                <span style="font-family:'IBM Plex Mono',monospace;font-size:13px;font-weight:700;color:#e74c3c">▲ {up_p}%</span>
+            </div>
             <div class="ratio-wrap">
                 <span class="kpi-value" style="color:#e74c3c">{up}</span>
                 <span style="color:#4a6080;font-size:20px">/</span>
@@ -664,8 +667,6 @@ def render_kpi(df, prev_codes, cb_codes):
             </div></div>
         <div class="kpi"><div class="kpi-label">新上榜 ★</div>
             <div class="kpi-value" style="color:#f39c12">{new_c}</div></div>
-        <div class="kpi"><div class="kpi-label">CB 上榜</div>
-            <div class="kpi-value" style="color:#a78bfa">{cb_c}</div></div>
     </div>""", unsafe_allow_html=True)
 
 def render_legend():
@@ -705,28 +706,17 @@ def page_realtime():
     trade_d = last_trade_date()
     today_k = tw.strftime("%Y-%m-%d")
 
-    pill = "status-pill" if open_ else "status-pill closed"
-    plbl = '<span class="blink">●</span> 盤中即時' if open_ else "● 非交易時段"
-    topbar_placeholder = st.empty()
-
-    with st.sidebar:
-        st.markdown("### ⚙️ 控制面板")
-        if st.button("⟳ 立即刷新", use_container_width=True):
-            st.cache_data.clear(); st.rerun()
-        st.markdown("---")
-        st.markdown(f"**台灣時間** `{tw.strftime('%H:%M:%S')}`")
-        st.markdown(f"**查詢日期** `{trade_d}`")
-        st.caption("資料來源: yfinance\n每 3 分鐘自動刷新")
-
+    # 先 fetch 資料，再渲染 topbar（顯示正確來源）
     with st.spinner("載入成交資料…"):
         if open_:
-            df, err = fetch_realtime_top30()
+            df, data_src = fetch_realtime_top30()
         else:
-            df, err = fetch_top30(trade_d)
+            df, data_src = fetch_top30(trade_d)
 
-    # 渲染 topbar（現在知道資料來源了）
-    data_src = err or "FinMind"
-    topbar_placeholder.markdown(f"""
+    pill = "status-pill" if open_ else "status-pill closed"
+    plbl = '<span class="blink">●</span> 盤中即時' if open_ else "● 非交易時段"
+
+    st.markdown(f"""
     <div class="topbar">
         <div><div class="topbar-logo">台股成交金額 TOP 30</div>
              <div class="topbar-sub">TWSE · DAILY VOLUME LEADERS · {data_src}</div></div>
@@ -737,8 +727,17 @@ def page_realtime():
         </div>
     </div>""", unsafe_allow_html=True)
 
+    with st.sidebar:
+        st.markdown("### ⚙️ 控制面板")
+        if st.button("⟳ 立即刷新", use_container_width=True):
+            st.cache_data.clear(); st.rerun()
+        st.markdown("---")
+        st.markdown(f"**台灣時間** `{tw.strftime('%H:%M:%S')}`")
+        st.markdown(f"**查詢日期** `{trade_d}`")
+        st.caption(f"資料來源: {data_src}\n每 3 分鐘自動刷新")
+
     if df is None or len(df) == 0:
-        st.error(f"❌ 資料載入失敗: {err}")
+        st.error(f"❌ 資料載入失敗: {data_src}")
         st.info("請稍後點「立即刷新」重試，或切換至「🔧 診斷」頁查看詳細錯誤。")
         return
 
