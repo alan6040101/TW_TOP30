@@ -250,22 +250,16 @@ def _fm_stock_price(date_str: str) -> pd.DataFrame:
                 df["stock_id"]    = df["stock_id"].astype(str).str.strip()
                 df["trade_value"] = pd.to_numeric(df["Trading_money"], errors="coerce").fillna(0) / 1e8
                 df["close"]       = pd.to_numeric(df["close"],  errors="coerce").fillna(0)
-                df["spread"]      = pd.to_numeric(df["spread"], errors="coerce").fillna(0)
-                df["prev_close"]  = df["close"] - df["spread"]
-                # spread 即漲跌價差（close - 昨收）；prev_close > 0 才計算
-                df["change_pct"]  = df.apply(
-                    lambda r: round(r["spread"] / r["prev_close"] * 100, 2)
-                    if r["prev_close"] > 0 else 0.0, axis=1)
-                # 若 spread=0 但 open != close，用 open 估算（極少數情況）
-                mask = (df["spread"] == 0) & (df["close"] != df.get("open", df["close"]))
-                if "open" in df.columns:
-                    df_open = pd.to_numeric(df["open"], errors="coerce").fillna(0)
-                    alt_prev = df_open  # open 近似昨收
-                    alt_chg  = df.apply(
-                        lambda r: round((r["close"] - float(df_open[r.name])) /
-                                        float(df_open[r.name]) * 100, 2)
-                        if float(df_open[r.name]) > 0 else 0.0, axis=1)
-                    df.loc[mask & (df_open > 0), "change_pct"] = alt_chg[mask & (df_open > 0)]
+                df["spread"]     = pd.to_numeric(df["spread"], errors="coerce").fillna(0)
+                df["prev_close"] = df["close"] - df["spread"]
+                # spread = 今收 - 昨收（FinMind 定義）
+                # prev_close > 0 才計算；平盤時 spread=0，change_pct=0.0（顯示 ─）
+                df["change_pct"] = 0.0
+                mask_valid = df["prev_close"] > 0
+                df.loc[mask_valid, "change_pct"] = (
+                    df.loc[mask_valid, "spread"] /
+                    df.loc[mask_valid, "prev_close"] * 100
+                ).round(2)
                 df = df[df["stock_id"].str.match(r"^\d{4}$") & (df["trade_value"] > 0)]
                 return df
     except Exception:
@@ -527,10 +521,12 @@ def build_table(df, prev_codes, cb_codes, extra=None, revenue_map=None):
         name      = prefix + base_name + suffix
 
         # 漲跌幅：只有非零才顯示，避免 yfinance 前後日相同導致誤判為 0
-        if abs(pct) >= 0.005:
-            pstr = f"▲ {pct:.2f}%" if pct > 0 else f"▼ {abs(pct):.2f}%"
+        if pct > 0:
+            pstr = f"▲ {pct:.2f}%"
+        elif pct < 0:
+            pstr = f"▼ {abs(pct):.2f}%"
         else:
-            pstr = "─"
+            pstr = "─"   # 真平盤：spread = 0
 
         # 月營收年增率
         rev_info  = (revenue_map or {}).get(code, {})
@@ -570,8 +566,8 @@ def build_table(df, prev_codes, cb_codes, extra=None, revenue_map=None):
     def cpct(col):
         result = []
         for v in pct_list:
-            if v > 0.005:    result.append("color: #e74c3c; font-weight: 600")
-            elif v < -0.005: result.append("color: #2ecc71; font-weight: 600")
+            if v > 0:    result.append("color: #e74c3c; font-weight: 600")
+            elif v < 0:  result.append("color: #2ecc71; font-weight: 600")
             else:           result.append("color: #5a6a80")
         return result
 
@@ -883,6 +879,28 @@ def page_diag():
         d = r.json()
         st.write(f"HTTP: {r.status_code}")
         st.json(d)
+    except Exception as e:
+        st.error(f"Exception: {e}")
+
+    # ── 1b. FinMind TaiwanStockPrice（台達電 2308，查看 spread 欄位）──
+    st.markdown("### 1b. FinMind TaiwanStockPrice - 台達電 (2308)")
+    try:
+        import datetime as _dt
+        test_date = (tw - _dt.timedelta(days=3 if tw.weekday() < 3 else tw.weekday()-1)).strftime("%Y-%m-%d")
+        r = requests.get("https://api.finmindtrade.com/api/v4/data",
+                         params={"dataset":"TaiwanStockPrice","data_id":"2308",
+                                 "date": test_date, "token": token or ""},
+                         timeout=15)
+        d = r.json()
+        st.write(f"HTTP:{r.status_code} status:{d.get('status')} date:{test_date}")
+        if d.get("data"):
+            df_tmp = pd.DataFrame(d["data"])
+            st.write(f"欄位: {list(df_tmp.columns)}")
+            st.dataframe(df_tmp[["date","stock_id","close","spread","open","max","min"] 
+                                 if all(c in df_tmp.columns for c in ["open","max","min"]) 
+                                 else df_tmp.columns.tolist()])
+        else:
+            st.error(str(d)[:300])
     except Exception as e:
         st.error(f"Exception: {e}")
 
