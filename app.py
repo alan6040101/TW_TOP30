@@ -707,16 +707,7 @@ def page_realtime():
 
     pill = "status-pill" if open_ else "status-pill closed"
     plbl = '<span class="blink">●</span> 盤中即時' if open_ else "● 非交易時段"
-    st.markdown(f"""
-    <div class="topbar">
-        <div><div class="topbar-logo">台股成交金額 TOP 30</div>
-             <div class="topbar-sub">TWSE · DAILY VOLUME LEADERS · yfinance</div></div>
-        <div style="text-align:right">
-            <div class="{pill}">{plbl}</div>
-            <div style="font-family:'IBM Plex Mono',monospace;font-size:11px;color:#2a3a50;margin-top:6px">
-                {tw.strftime("%Y/%m/%d &nbsp; %H:%M:%S")} (台灣時間)</div>
-        </div>
-    </div>""", unsafe_allow_html=True)
+    topbar_placeholder = st.empty()
 
     with st.sidebar:
         st.markdown("### ⚙️ 控制面板")
@@ -733,9 +724,22 @@ def page_realtime():
         else:
             df, err = fetch_top30(trade_d)
 
+    # 渲染 topbar（現在知道資料來源了）
+    data_src = err or "FinMind"
+    topbar_placeholder.markdown(f"""
+    <div class="topbar">
+        <div><div class="topbar-logo">台股成交金額 TOP 30</div>
+             <div class="topbar-sub">TWSE · DAILY VOLUME LEADERS · {data_src}</div></div>
+        <div style="text-align:right">
+            <div class="{pill}">{plbl}</div>
+            <div style="font-family:'IBM Plex Mono',monospace;font-size:11px;color:#2a3a50;margin-top:6px">
+                {tw.strftime("%Y/%m/%d &nbsp; %H:%M:%S")} (台灣時間)</div>
+        </div>
+    </div>""", unsafe_allow_html=True)
+
     if df is None or len(df) == 0:
         st.error(f"❌ 資料載入失敗: {err}")
-        st.info("yfinance 偶爾會有延遲，請稍後點「立即刷新」重試。")
+        st.info("請稍後點「立即刷新」重試，或切換至「🔧 診斷」頁查看詳細錯誤。")
         return
 
     cb_codes, _cb_src = fetch_cb_stocks()
@@ -889,7 +893,7 @@ def page_diag():
         test_date = (tw - _dt.timedelta(days=3 if tw.weekday() < 3 else tw.weekday()-1)).strftime("%Y-%m-%d")
         r = requests.get("https://api.finmindtrade.com/api/v4/data",
                          params={"dataset":"TaiwanStockPrice","data_id":"2308",
-                                 "date": test_date, "token": token or ""},
+                                 "start_date": test_date, "token": token or ""},
                          timeout=15)
         d = r.json()
         st.write(f"HTTP:{r.status_code} status:{d.get('status')} date:{test_date}")
