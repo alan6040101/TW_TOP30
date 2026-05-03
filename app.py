@@ -304,89 +304,91 @@ def fetch_realtime_top30() -> tuple:
 
 # ─────────────────────────────────────────────────────────────────────────────
 # 月營收年增率 + 創歷史新高
+# 資料來源：FinMind API（免費，不需 token 即可查詢月營收）
 # ─────────────────────────────────────────────────────────────────────────────
-def _read_finmind_token() -> str:
-    """讀取 FinMind token（支援多種 secrets 格式）"""
-    for k in ["finmind_token","FINMIND_TOKEN","finmind_api_token"]:
+def _read_token() -> str:
+    """讀取 FinMind token（選填；無 token 也能查月營收）"""
+    for k in ["finmind_token", "FINMIND_TOKEN", "finmind_api_token"]:
         try:
-            v = st.secrets.get(k,"")
-            if v: return str(v).strip()
+            v = str(st.secrets.get(k, "")).strip()
+            if v and len(v) > 20: return v
         except: pass
     try:
-        v = st.secrets.get("finmind",{}).get("token","")
-        if v: return str(v).strip()
+        v = str(st.secrets.get("finmind", {}).get("token", "")).strip()
+        if v and len(v) > 20: return v
     except: pass
     return ""
 
 
-@st.cache_data(ttl=3600, show_spinner=False)
+def _fm_revenue(dataset: str, params: dict) -> list:
+    """呼叫 FinMind API，回傳 data list 或空 list"""
+    base_params = {"dataset": dataset}
+    token = _read_token()
+    if token:
+        base_params["token"] = token
+    base_params.update(params)
+    try:
+        r   = requests.get("https://api.finmindtrade.com/api/v4/data",
+                           params=base_params, timeout=25)
+        raw = r.json()
+        if int(str(raw.get("status", 0))) == 200:
+            return raw.get("data") or []
+    except Exception:
+        pass
+    return []
+
+
+@st.cache_data(ttl=7200, show_spinner=False)   # cache 2 小時
 def fetch_revenue_yoy(codes: list) -> dict:
     """
     取最新月營收年增率 (YoY%) 與是否創歷史新高。
     回傳 {code: {"yoy": float, "is_high": bool}}
 
-    資料來源:
-      主要 — FinMind TaiwanStockMonthRevenue
-      備援 — 回傳空 dict (不顯示此欄)
+    使用 FinMind TaiwanStockMonthRevenue：
+      - 無 token 也可查詢（免費額度）
+      - 不帶 data_id 一次抓全市場最近 14 個月資料
     """
-    result = {}
-    token  = _read_finmind_token()
-    if not token:
+    result  = {}
+    start   = (datetime.now() - timedelta(days=430)).strftime("%Y-%m-%d")
+
+    # 不帶 data_id → 全市場；FinMind 免費版支援
+    data = _fm_revenue("TaiwanStockMonthRevenue", {"start_date": start})
+
+    if not data:
         return result
 
-    from datetime import datetime, timedelta
-    # 抓近 13 個月資料（計算 YoY 需要去年同月）
-    start = (datetime.now() - timedelta(days=400)).strftime("%Y-%m-%d")
+    df = pd.DataFrame(data)
+    if not {"stock_id", "revenue", "date"}.issubset(df.columns):
+        return result
 
-    # FinMind 支援批次查詢，但 TaiwanStockMonthRevenue 需逐股或用 date 全撈
-    # 先嘗試不帶 data_id 撈最近一期全市場
-    try:
-        params = {
-            "dataset": "TaiwanStockMonthRevenue",
-            "start_date": start,
-            "token": token,
-        }
-        r    = requests.get("https://api.finmindtrade.com/api/v4/data",
-                            params=params, timeout=30)
-        raw  = r.json()
-        stat = int(str(raw.get("status", 0)))
-        if stat == 200 and raw.get("data"):
-            df = pd.DataFrame(raw["data"])
-            # 欄位: date, stock_id, country, revenue, revenue_month, revenue_year
-            # revenue = 當月營收(千元), date = YYYY-MM-DD
-            if {"stock_id","revenue","date"}.issubset(df.columns):
-                df["date"] = pd.to_datetime(df["date"])
-                df["revenue"] = pd.to_numeric(df["revenue"], errors="coerce").fillna(0)
-                df["stock_id"] = df["stock_id"].astype(str)
+    df["date"]     = pd.to_datetime(df["date"])
+    df["revenue"]  = pd.to_numeric(df["revenue"], errors="coerce").fillna(0)
+    df["stock_id"] = df["stock_id"].astype(str).str.strip()
 
-                for code in codes:
-                    sub = df[df["stock_id"] == code].sort_values("date")
-                    if len(sub) < 2:
-                        continue
-                    # 最新月
-                    latest     = sub.iloc[-1]
-                    latest_rev = latest["revenue"]
-                    latest_dt  = latest["date"]
+    code_set = set(str(c) for c in codes)
+    df = df[df["stock_id"].isin(code_set)]
 
-                    # 去年同月 (±1個月容錯)
-                    target_dt  = latest_dt - pd.DateOffset(months=12)
-                    same_month = sub[
-                        (sub["date"] >= target_dt - pd.Timedelta(days=32)) &
-                        (sub["date"] <= target_dt + pd.Timedelta(days=32))
-                    ]
-                    if same_month.empty or same_month.iloc[-1]["revenue"] <= 0:
-                        continue
-                    prev_rev = same_month.iloc[-1]["revenue"]
-                    yoy      = round((latest_rev - prev_rev) / prev_rev * 100, 1)
+    for code in codes:
+        code = str(code)
+        sub  = df[df["stock_id"] == code].sort_values("date").reset_index(drop=True)
+        if len(sub) < 13:   # 需至少 13 個月才能算 YoY
+            continue
 
-                    # 是否創歷史新高（近 12 個月最高）
-                    hist_max  = sub["revenue"].max()
-                    is_high   = (latest_rev >= hist_max) and (latest_rev > 0)
+        latest_rev = sub["revenue"].iloc[-1]
+        latest_dt  = sub["date"].iloc[-1]
+        if latest_rev <= 0:
+            continue
 
-                    result[code] = {"yoy": yoy, "is_high": is_high}
-                return result
-    except Exception:
-        pass
+        # 去年同月（前 12 筆）
+        prev_rev = sub["revenue"].iloc[-13]
+        if prev_rev <= 0:
+            continue
+
+        yoy     = round((latest_rev - prev_rev) / prev_rev * 100, 1)
+        # 創歷史新高 = 最新月 >= 本資料集中所有月份最高值
+        is_high = bool(latest_rev >= sub["revenue"].max())
+
+        result[code] = {"yoy": yoy, "is_high": is_high}
 
     return result
 
