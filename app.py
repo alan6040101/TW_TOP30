@@ -352,53 +352,72 @@ def build_table(df, prev_codes, cb_codes, extra=None):
     disp["__p"] = pcts
     disp["__n"] = news
 
+    # ── Pandas Styler: apply() 必須回傳完整 CSS 屬性字串 e.g. "background-color: #xxx" ──
     def rbg(row):
-        bg = ("#191000" if row["__n"] else
-              "#1a0808" if row["__p"]>0 else
-              "#041008" if row["__p"]<0 else "#0a1520")
-        return [bg]*len(row)
+        if row["__n"]:      bg = "#191000"
+        elif row["__p"]>0:  bg = "#1a0808"
+        elif row["__p"]<0:  bg = "#041008"
+        else:               bg = "#0a1520"
+        return [f"background-color: {bg}"] * len(row)
+
     def cpct(col):
-        return ["color:#e74c3c;font-weight:600" if v>0
-                else ("color:#2ecc71;font-weight:600" if v<0 else "color:#5a6a80")
-                for v in disp["__p"]]
+        result = []
+        for v in disp["__p"]:
+            if v > 0:   result.append("color: #e74c3c; font-weight: 600")
+            elif v < 0: result.append("color: #2ecc71; font-weight: 600")
+            else:       result.append("color: #5a6a80")
+        return result
+
     def cname(col):
-        s=[]
+        result = []
         for i, v in enumerate(disp["股票名稱"]):
-            n=disp["__n"].iloc[i]; cb="CB" in str(v)
-            s.append("color:#f39c12;font-weight:700" if n
-                     else "color:#a78bfa" if cb else "color:#c8d6e5")
-        return s
+            n  = disp["__n"].iloc[i]
+            cb = "CB" in str(v)
+            if n:    result.append("color: #f39c12; font-weight: 700")
+            elif cb: result.append("color: #a78bfa")
+            else:    result.append("color: #c8d6e5")
+        return result
+
     def crank(col):
-        return ["color:#4fc3f7;font-weight:700" if v<=3 else "color:#4a6080"
+        return ["color: #4fc3f7; font-weight: 700" if v <= 3 else "color: #4a6080"
                 for v in disp["排行"]]
 
-    fmt = {"成交金額(億)":"{:,.1f}"}
+    fmt = {"成交金額(億)": "{:,.1f}"}
     if extra:
         for _, d2 in extra:
             if "億" in d2: fmt[d2] = "{:,.1f}"
 
     return (
         disp.style
-        .apply(rbg, axis=1).apply(cpct,subset=["漲跌幅"])
-        .apply(cname,subset=["股票名稱"]).apply(crank,subset=["排行"])
+        .apply(rbg,   axis=1)
+        .apply(cpct,  subset=["漲跌幅"])
+        .apply(cname, subset=["股票名稱"])
+        .apply(crank, subset=["排行"])
         .format(fmt)
-        .set_properties(**{"font-family":"'IBM Plex Mono',monospace","font-size":"13px","border":"none"})
-        .set_properties(subset=["排行"],               **{"text-align":"center"})
-        .set_properties(subset=["股票名稱"],            **{"text-align":"left"})
-        .set_properties(subset=["漲跌幅","成交金額(億)"],**{"text-align":"right"})
+        .set_properties(**{"font-family": "IBM Plex Mono, monospace",
+                           "font-size": "13px", "border": "none"})
+        .set_properties(subset=["排行"],                        **{"text-align": "center"})
+        .set_properties(subset=["股票名稱"],                     **{"text-align": "left"})
+        .set_properties(subset=["漲跌幅", "成交金額(億)"],       **{"text-align": "right"})
         .set_table_styles([
-            {"selector":"thead th","props":[
-                ("background-color","#0a1520"),("color","#4a6080"),
-                ("font-family","'IBM Plex Mono',monospace"),("font-size","11px"),
-                ("letter-spacing","1.5px"),("text-transform","uppercase"),
-                ("border-bottom","1px solid #1a2940"),("padding","10px 14px")]},
-            {"selector":"tbody td","props":[
-                ("padding","10px 14px"),("border-bottom","1px solid #0d1a28")]},
-            {"selector":"tbody tr:hover td","props":[("filter","brightness(1.3)")]},
-            {"selector":"table","props":[("width","100%"),("border-collapse","collapse")]},
+            {"selector": "thead th", "props": [
+                ("background-color", "#0a1520"), ("color", "#4a6080"),
+                ("font-family", "IBM Plex Mono, monospace"), ("font-size", "11px"),
+                ("letter-spacing", "1.5px"), ("text-transform", "uppercase"),
+                ("border-bottom", "1px solid #1a2940"), ("padding", "10px 14px"),
+            ]},
+            {"selector": "tbody td", "props": [
+                ("padding", "10px 14px"), ("border-bottom", "1px solid #0d1a28"),
+            ]},
+            {"selector": "tbody tr:hover td", "props": [
+                ("filter", "brightness(1.3)"),
+            ]},
+            {"selector": "table", "props": [
+                ("width", "100%"), ("border-collapse", "collapse"),
+            ]},
         ])
         .hide(axis="index")
-        .hide(subset=["__p","__n"],axis="columns")
+        .hide(subset=["__p", "__n"], axis="columns")
     )
 
 # ─────────────────────────────────────────────────────────────────────────────
