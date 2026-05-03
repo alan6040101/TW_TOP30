@@ -180,121 +180,137 @@ def is_market_open() -> bool:
 # ─────────────────────────────────────────────────────────────────────────────
 # yfinance 資料抓取
 # ─────────────────────────────────────────────────────────────────────────────
-@st.cache_data(ttl=170, show_spinner=False)   # ~3 分鐘
-def fetch_top30(trade_date: str) -> tuple:
-    """
-    用 yfinance 批次下載股票日資料，計算成交金額排行。
-    回傳 (df, error_msg)
-    df 欄位: rank, code, name, trade_value(億), change_pct
-    """
-    codes   = list(STOCK_POOL.keys())
-    symbols = [f"{c}.TW" for c in codes]
-
+# ─────────────────────────────────────────────────────────────────────────────
+# 成交金額 TOP30：FinMind 為主，yfinance 備援
+# ─────────────────────────────────────────────────────────────────────────────
+def _read_token() -> str:
+    """讀取 FinMind token，支援多種 secrets.toml 格式"""
+    for k in ["finmind_token", "FINMIND_TOKEN", "finmind_api_token"]:
+        try:
+            v = str(st.secrets.get(k, "")).strip()
+            if v and len(v) > 20: return v
+        except: pass
     try:
-        # 下載近 5 天（確保假日也能取到最新一筆）
-        start = (datetime.strptime(trade_date, "%Y-%m-%d") - timedelta(days=7)).strftime("%Y-%m-%d")
-        end   = (datetime.strptime(trade_date, "%Y-%m-%d") + timedelta(days=1)).strftime("%Y-%m-%d")
+        gcp = st.secrets.get("gcp_service_account", {})
+        for k in ["finmind_token", "FINMIND_TOKEN", "finmind_api_token"]:
+            v = str(gcp.get(k, "")).strip()
+            if v and len(v) > 20: return v
+    except: pass
+    try:
+        v = str(st.secrets.get("finmind", {}).get("token", "")).strip()
+        if v and len(v) > 20: return v
+    except: pass
+    return ""
 
-        raw = yf.download(
-            tickers    = symbols,
-            start      = start,
-            end        = end,
-            auto_adjust= True,
-            progress   = False,
-            threads    = True,
-        )
 
+def _fm_stock_price(date_str: str) -> pd.DataFrame:
+    """
+    FinMind TaiwanStockPrice 取全市場當日成交。
+    欄位: stock_id, Trading_money(元), close, spread
+    失敗回傳空 DataFrame。
+    """
+    token = _read_token()
+    if not token:
+        return pd.DataFrame()
+    try:
+        r = requests.get(
+            "https://api.finmindtrade.com/api/v4/data",
+            params={"dataset": "TaiwanStockPrice",
+                    "date":    date_str,
+                    "token":   token},
+            timeout=25)
+        raw = r.json()
+        if int(str(raw.get("status", 0))) == 200 and raw.get("data"):
+            df = pd.DataFrame(raw["data"])
+            need = {"stock_id", "Trading_money", "close", "spread"}
+            if need.issubset(df.columns):
+                df["stock_id"]    = df["stock_id"].astype(str).str.strip()
+                df["trade_value"] = pd.to_numeric(df["Trading_money"], errors="coerce").fillna(0) / 1e8
+                df["close"]       = pd.to_numeric(df["close"],  errors="coerce").fillna(0)
+                df["spread"]      = pd.to_numeric(df["spread"], errors="coerce").fillna(0)
+                df["prev_close"]  = df["close"] - df["spread"]
+                df["change_pct"]  = df.apply(
+                    lambda r: round(r["spread"] / r["prev_close"] * 100, 2)
+                    if r["prev_close"] > 0 else 0.0, axis=1)
+                df = df[df["stock_id"].str.match(r"^\d{4}$") & (df["trade_value"] > 0)]
+                return df
+    except Exception:
+        pass
+    return pd.DataFrame()
+
+
+def _yf_top30(symbols, name_pool, period_kw: dict) -> tuple:
+    """yfinance 備援，回傳 (df, label) 或 (empty, err)"""
+    try:
+        raw = yf.download(tickers=symbols, auto_adjust=True, progress=False,
+                          threads=True, **period_kw)
         if raw.empty:
-            return pd.DataFrame(), "yfinance 回傳空資料"
-
-        # 取最新一天
-        close_df  = raw["Close"].iloc[-1]   # 最新收盤價
-        volume_df = raw["Volume"].iloc[-1]  # 最新成交量(股)
+            return pd.DataFrame(), "yfinance 無資料"
+        close_df  = raw["Close"].iloc[-1]
+        volume_df = raw["Volume"].iloc[-1]
         prev_df   = raw["Close"].iloc[-2] if len(raw) >= 2 else close_df
-
         rows = []
         for sym in symbols:
             try:
-                code   = sym.replace(".TW","")
-                close  = float(close_df.get(sym, 0) or 0)
-                vol    = float(volume_df.get(sym, 0) or 0)
-                prev   = float(prev_df.get(sym, close) or close)
-                if close <= 0 or vol <= 0:
-                    continue
-                tv     = round(close * vol / 1e8, 2)          # 成交金額(億)
-                chg    = round((close - prev) / prev * 100, 2) if prev > 0 else 0
-                name   = STOCK_POOL.get(code, code)
-                rows.append({"code":code,"name":name,"trade_value":tv,"change_pct":chg})
-            except:
-                continue
-
+                code  = sym.replace(".TW", "")
+                close = float(close_df.get(sym, 0) or 0)
+                vol   = float(volume_df.get(sym, 0) or 0)
+                prev  = float(prev_df.get(sym, close) or close)
+                if close <= 0 or vol <= 0: continue
+                tv  = round(close * vol / 1e8, 2)
+                chg = round((close - prev) / prev * 100, 2) if prev > 0 and close != prev else 0.0
+                rows.append({"code": code, "name": name_pool.get(code, code),
+                             "trade_value": tv, "change_pct": chg})
+            except: continue
         if not rows:
-            return pd.DataFrame(), "所有股票成交金額均為 0，可能是假日或資料延遲"
-
-        df = (pd.DataFrame(rows)
-              .sort_values("trade_value", ascending=False)
-              .head(30)
-              .reset_index(drop=True))
-        df["rank"] = range(1, len(df)+1)
-        return df[["rank","code","name","trade_value","change_pct"]], None
-
+            return pd.DataFrame(), "yfinance 全部無資料"
+        df = (pd.DataFrame(rows).sort_values("trade_value", ascending=False)
+              .head(30).reset_index(drop=True))
+        df["rank"] = range(1, len(df) + 1)
+        return df[["rank", "code", "name", "trade_value", "change_pct"]], "yfinance"
     except Exception as e:
         return pd.DataFrame(), f"yfinance 例外: {e}"
 
 
 @st.cache_data(ttl=170, show_spinner=False)
+def fetch_top30(trade_date: str) -> tuple:
+    """盤後成交排行。主：FinMind；備：yfinance。回傳 (df, source)"""
+    name_map = fetch_name_map()
+
+    df_fm = _fm_stock_price(trade_date)
+    if len(df_fm) >= 10:
+        df_fm["name"] = df_fm["stock_id"].map(name_map).fillna(df_fm["stock_id"])
+        df_fm = df_fm.sort_values("trade_value", ascending=False).head(30).reset_index(drop=True)
+        df_fm["rank"] = range(1, len(df_fm) + 1)
+        return (df_fm.rename(columns={"stock_id": "code"})
+                [["rank", "code", "name", "trade_value", "change_pct"]],
+                "FinMind TaiwanStockPrice")
+
+    symbols = [f"{c}.TW" for c in STOCK_POOL]
+    start = (datetime.strptime(trade_date, "%Y-%m-%d") - timedelta(days=7)).strftime("%Y-%m-%d")
+    end   = (datetime.strptime(trade_date, "%Y-%m-%d") + timedelta(days=1)).strftime("%Y-%m-%d")
+    df, src = _yf_top30(symbols, STOCK_POOL, {"start": start, "end": end})
+    return df, src or "yfinance (備援)"
+
+
+@st.cache_data(ttl=170, show_spinner=False)
 def fetch_realtime_top30() -> tuple:
-    """
-    盤中即時：用 yfinance Ticker.fast_info 取得即時成交量與價格。
-    批次用 download(period='1d', interval='1m') 取分鐘資料。
-    """
-    codes   = list(STOCK_POOL.keys())
-    symbols = [f"{c}.TW" for c in codes]
+    """盤中即時排行。主：FinMind；備：yfinance。回傳 (df, source)"""
+    name_map   = fetch_name_map()
+    trade_date = tw_now().strftime("%Y-%m-%d")
 
-    try:
-        # period='1d' 取今日資料，interval='1m' 分鐘級
-        raw = yf.download(
-            tickers  = symbols,
-            period   = "2d",       # 取 2 天確保有昨收
-            interval = "1d",       # 日線（盤中會取到目前累積）
-            auto_adjust = True,
-            progress = False,
-            threads  = True,
-        )
+    df_fm = _fm_stock_price(trade_date)
+    if len(df_fm) >= 10:
+        df_fm["name"] = df_fm["stock_id"].map(name_map).fillna(df_fm["stock_id"])
+        df_fm = df_fm.sort_values("trade_value", ascending=False).head(30).reset_index(drop=True)
+        df_fm["rank"] = range(1, len(df_fm) + 1)
+        return (df_fm.rename(columns={"stock_id": "code"})
+                [["rank", "code", "name", "trade_value", "change_pct"]],
+                "FinMind 即時")
 
-        if raw.empty:
-            return pd.DataFrame(), "無即時資料"
-
-        close_df  = raw["Close"].iloc[-1]
-        volume_df = raw["Volume"].iloc[-1]
-        prev_df   = raw["Close"].iloc[-2] if len(raw) >= 2 else close_df
-
-        rows = []
-        for sym in symbols:
-            try:
-                code  = sym.replace(".TW","")
-                close = float(close_df.get(sym, 0) or 0)
-                vol   = float(volume_df.get(sym, 0) or 0)
-                prev  = float(prev_df.get(sym, close) or close)
-                if close <= 0 or vol <= 0: continue
-                tv    = round(close * vol / 1e8, 2)
-                chg   = round((close - prev) / prev * 100, 2) if prev > 0 else 0
-                name  = STOCK_POOL.get(code, code)
-                rows.append({"code":code,"name":name,"trade_value":tv,"change_pct":chg})
-            except:
-                continue
-
-        if not rows:
-            return pd.DataFrame(), "即時資料為空"
-
-        df = (pd.DataFrame(rows)
-              .sort_values("trade_value", ascending=False)
-              .head(30).reset_index(drop=True))
-        df["rank"] = range(1, len(df)+1)
-        return df[["rank","code","name","trade_value","change_pct"]], None
-
-    except Exception as e:
-        return pd.DataFrame(), f"即時資料例外: {e}"
+    symbols = [f"{c}.TW" for c in STOCK_POOL]
+    df, src = _yf_top30(symbols, STOCK_POOL, {"period": "2d", "interval": "1d"})
+    return df, src or "yfinance 即時(備援)"
 
 # ─────────────────────────────────────────────────────────────────────────────
 # 月營收年增率 + 創歷史新高
