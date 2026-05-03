@@ -117,6 +117,49 @@ STOCK_POOL = {
 # 整理成乾淨的 dict (去掉 key 打錯的)
 STOCK_POOL = {k:v for k,v in STOCK_POOL.items() if re.match(r"^\d{4}$", str(k))}
 
+
+def _read_token() -> str:
+    """讀取 FinMind token，支援多種 secrets.toml 格式"""
+    for k in ["finmind_token", "FINMIND_TOKEN", "finmind_api_token"]:
+        try:
+            v = str(st.secrets.get(k, "")).strip()
+            if v and len(v) > 20: return v
+        except: pass
+    try:
+        gcp = st.secrets.get("gcp_service_account", {})
+        for k in ["finmind_token", "FINMIND_TOKEN", "finmind_api_token"]:
+            v = str(gcp.get(k, "")).strip()
+            if v and len(v) > 20: return v
+    except: pass
+    try:
+        v = str(st.secrets.get("finmind", {}).get("token", "")).strip()
+        if v and len(v) > 20: return v
+    except: pass
+    return ""
+
+
+@st.cache_data(ttl=86400, show_spinner=False)
+def fetch_name_map() -> dict:
+    """從 FinMind TaiwanStockInfo 取股票名稱對照表，備援用 STOCK_POOL"""
+    token = _read_token()
+    if token:
+        try:
+            r   = requests.get("https://api.finmindtrade.com/api/v4/data",
+                               params={"dataset": "TaiwanStockInfo", "token": token},
+                               timeout=15)
+            raw = r.json()
+            if int(str(raw.get("status", 0))) == 200 and raw.get("data"):
+                df   = pd.DataFrame(raw["data"])
+                id_c = next((c for c in df.columns if "stock_id"   in c.lower()), None)
+                nm_c = next((c for c in df.columns if "stock_name" in c.lower()), None)
+                if id_c and nm_c:
+                    api_map = dict(zip(df[id_c].astype(str), df[nm_c].astype(str)))
+                    return {**STOCK_POOL, **api_map}
+        except Exception:
+            pass
+    return dict(STOCK_POOL)   # fallback to built-in pool
+
+
 # CB 可轉債：只用 FinMind（TWSE SSL 被 Streamlit Cloud 封，thefew.tw 無靜態資料）
 @st.cache_data(ttl=3600, show_spinner=False)
 def fetch_cb_stocks() -> tuple:
@@ -183,26 +226,6 @@ def is_market_open() -> bool:
 # ─────────────────────────────────────────────────────────────────────────────
 # 成交金額 TOP30：FinMind 為主，yfinance 備援
 # ─────────────────────────────────────────────────────────────────────────────
-def _read_token() -> str:
-    """讀取 FinMind token，支援多種 secrets.toml 格式"""
-    for k in ["finmind_token", "FINMIND_TOKEN", "finmind_api_token"]:
-        try:
-            v = str(st.secrets.get(k, "")).strip()
-            if v and len(v) > 20: return v
-        except: pass
-    try:
-        gcp = st.secrets.get("gcp_service_account", {})
-        for k in ["finmind_token", "FINMIND_TOKEN", "finmind_api_token"]:
-            v = str(gcp.get(k, "")).strip()
-            if v and len(v) > 20: return v
-    except: pass
-    try:
-        v = str(st.secrets.get("finmind", {}).get("token", "")).strip()
-        if v and len(v) > 20: return v
-    except: pass
-    return ""
-
-
 def _fm_stock_price(date_str: str) -> pd.DataFrame:
     """
     FinMind TaiwanStockPrice 取全市場當日成交。
@@ -316,46 +339,6 @@ def fetch_realtime_top30() -> tuple:
 # 月營收年增率 + 創歷史新高
 # 資料來源：FinMind API（免費，不需 token 即可查詢月營收）
 # ─────────────────────────────────────────────────────────────────────────────
-def _read_token() -> str:
-    """
-    讀取 FinMind token，支援以下 secrets.toml 格式：
-
-    格式A（推薦，頂層 key）:
-        [gcp_service_account]
-        ...
-        universe_domain = "googleapis.com"
-
-        finmind_token = "eyJ..."   ← 在區塊外面
-
-    格式B（在區塊內，會被讀為 gcp_service_account.finmind_token）:
-        [gcp_service_account]
-        ...
-        finmind_token = "eyJ..."   ← 在區塊裡面
-    """
-    # 格式A：頂層 key（正確格式）
-    for k in ["finmind_token", "FINMIND_TOKEN", "finmind_api_token"]:
-        try:
-            v = str(st.secrets.get(k, "")).strip()
-            if v and len(v) > 20: return v
-        except: pass
-
-    # 格式B：在 gcp_service_account 區塊內
-    try:
-        gcp = st.secrets.get("gcp_service_account", {})
-        for k in ["finmind_token", "FINMIND_TOKEN", "finmind_api_token"]:
-            v = str(gcp.get(k, "")).strip()
-            if v and len(v) > 20: return v
-    except: pass
-
-    # 格式C：[finmind] 區塊
-    try:
-        v = str(st.secrets.get("finmind", {}).get("token", "")).strip()
-        if v and len(v) > 20: return v
-    except: pass
-
-    return ""
-
-
 def _fm_revenue(dataset: str, params: dict) -> list:
     """呼叫 FinMind API，回傳 data list 或空 list"""
     base_params = {"dataset": dataset}
