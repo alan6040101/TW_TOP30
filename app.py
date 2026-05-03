@@ -350,16 +350,42 @@ def fetch_realtime_top30() -> tuple:
 # 資料來源：FinMind API（免費，不需 token 即可查詢月營收）
 # ─────────────────────────────────────────────────────────────────────────────
 def _read_token() -> str:
-    """讀取 FinMind token（選填；無 token 也能查月營收）"""
+    """
+    讀取 FinMind token，支援以下 secrets.toml 格式：
+
+    格式A（推薦，頂層 key）:
+        [gcp_service_account]
+        ...
+        universe_domain = "googleapis.com"
+
+        finmind_token = "eyJ..."   ← 在區塊外面
+
+    格式B（在區塊內，會被讀為 gcp_service_account.finmind_token）:
+        [gcp_service_account]
+        ...
+        finmind_token = "eyJ..."   ← 在區塊裡面
+    """
+    # 格式A：頂層 key（正確格式）
     for k in ["finmind_token", "FINMIND_TOKEN", "finmind_api_token"]:
         try:
             v = str(st.secrets.get(k, "")).strip()
             if v and len(v) > 20: return v
         except: pass
+
+    # 格式B：在 gcp_service_account 區塊內
+    try:
+        gcp = st.secrets.get("gcp_service_account", {})
+        for k in ["finmind_token", "FINMIND_TOKEN", "finmind_api_token"]:
+            v = str(gcp.get(k, "")).strip()
+            if v and len(v) > 20: return v
+    except: pass
+
+    # 格式C：[finmind] 區塊
     try:
         v = str(st.secrets.get("finmind", {}).get("token", "")).strip()
         if v and len(v) > 20: return v
     except: pass
+
     return ""
 
 
