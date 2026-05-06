@@ -117,7 +117,6 @@ STOCK_POOL = {
 # 整理成乾淨的 dict (去掉 key 打錯的)
 STOCK_POOL = {k:v for k,v in STOCK_POOL.items() if re.match(r"^\d{4}$", str(k))}
 
-
 def _read_token() -> str:
     """讀取 FinMind token，支援多種 secrets.toml 格式"""
     for k in ["finmind_token", "FINMIND_TOKEN", "finmind_api_token"]:
@@ -136,7 +135,6 @@ def _read_token() -> str:
         if v and len(v) > 20: return v
     except: pass
     return ""
-
 
 @st.cache_data(ttl=86400, show_spinner=False)
 def fetch_name_map() -> dict:
@@ -159,159 +157,6 @@ def fetch_name_map() -> dict:
             pass
     return dict(STOCK_POOL)   # fallback to built-in pool
 
-
-# ─────────────────────────────────────────────────────────────────────────────
-# CB 可轉債資料
-# ─────────────────────────────────────────────────────────────────────────────
-@st.cache_data(ttl=3600, show_spinner=False)
-def fetch_cb_stocks() -> tuple:
-    """
-    回傳 (codes_set, source_label)
-
-    來源1: TWSE CB_OVERVIEW / CB_BOND_INFO（verify=False 繞 SSL）
-    來源2: FinMind（需付費，留著備用）
-    來源3: thefew.tw JS bundle（Rails app，掃 application-*.js）
-    """
-    import urllib3
-    urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
-
-    TWSE_H = {"User-Agent": "Mozilla/5.0", "Referer": "https://www.twse.com.tw/"}
-
-    # ── 來源1: TWSE（verify=False 繞過 SSL 憑證錯誤）──
-    for url in [
-        "https://www.twse.com.tw/rwd/zh/cbInfo/CB_OVERVIEW",
-        "https://www.twse.com.tw/rwd/zh/cbInfo/CB_BOND_INFO",
-    ]:
-        try:
-            r = requests.get(url, headers=TWSE_H, timeout=15, verify=False)
-            d = r.json()
-            if d.get("stat") == "OK" and d.get("data"):
-                fields = d.get("fields", [])
-                # 找股票代號欄的 index
-                stock_idx = None
-                for idx, f in enumerate(fields):
-                    if any(k in str(f) for k in ["股票代號","標的","證券代號"]):
-                        stock_idx = idx
-                        break
-                codes = set()
-                for row in d["data"]:
-                    # 優先用股票代號欄
-                    if stock_idx is not None:
-                        try:
-                            s = str(row[stock_idx]).strip()
-                            if re.match(r"^\d{4}$", s): codes.add(s)
-                        except Exception:
-                            pass
-                    # 掃所有欄：4碼直接用，6碼取前4碼
-                    for cell in row:
-                        s = str(cell).strip()
-                        if re.match(r"^\d{4}$", s): codes.add(s)
-                        elif re.match(r"^\d{6}$", s): codes.add(s[:4])
-                if len(codes) >= 5:
-                    return codes, f"TWSE {url.split('/')[-1]} ({len(codes)}支)"
-        except Exception:
-            pass
-
-    # ── 來源2: FinMind（需付費帳號）──
-    token = _read_token()
-    if token:
-        for ds in ["TaiwanStockConvertibleBondInfo",
-                   "TaiwanStockConvertibleBondDetail"]:
-            try:
-                r   = requests.get("https://api.finmindtrade.com/api/v4/data",
-                                   params={"dataset": ds, "token": token}, timeout=10)
-                raw = r.json()
-                if int(str(raw.get("status", 0))) == 200 and raw.get("data"):
-                    df    = pd.DataFrame(raw["data"])
-                    codes = set()
-                    for col in df.columns:
-                        for v in df[col].astype(str):
-                            s = v.strip()
-                            if re.match(r"^\d{4}$", s): codes.add(s)
-                            elif re.match(r"^\d{6}$", s): codes.add(s[:4])
-                    if len(codes) >= 5:
-                        return codes, f"FinMind {ds} ({len(codes)}支)"
-            except Exception:
-                continue
-
-    # ── 來源3: thefew.tw JS bundle（Rails app） ──
-    try:
-        from bs4 import BeautifulSoup
-        js_hdrs = {
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/124",
-            "Referer": "https://thefew.tw/",
-            "Accept": "*/*",
-        }
-        html_hdrs = {**js_hdrs, "Accept": "text/html"}
-
-        r_html = requests.get("https://thefew.tw/cb", headers=html_hdrs, timeout=15)
-        soup   = BeautifulSoup(r_html.text, "html.parser")
-
-        # 取所有 /packs/js/*.js 的 script src（Rails Webpacker 格式）
-        all_scripts = []
-        for tag in soup.find_all("script", src=True):
-            s = tag["src"]
-            if "/packs/js/" in s or s.endswith(".js"):
-                url = f"https://thefew.tw{s}" if s.startswith("/") else s
-                all_scripts.append(url)
-
-        # 優先掃 application-*.js（最大 bundle，包含所有路由和 API call）
-        all_scripts.sort(key=lambda u: (0 if "application" in u else
-                                         1 if "522" in u or "918" in u else 2))
-
-        for js_url in all_scripts[:6]:
-            try:
-                r_js   = requests.get(js_url, headers=js_hdrs, timeout=15)
-                js_txt = r_js.text
-
-                # 策略A: 找 API 路徑，呼叫取 JSON
-                api_paths = list(set(re.findall(r'["\'](/api/[a-zA-Z0-9_/-]+)["\']', js_txt)))
-                for ap in api_paths:
-                    if any(k in ap.lower() for k in ["cb","bond","convert","stock"]):
-                        try:
-                            r_api = requests.get(f"https://thefew.tw{ap}",
-                                                  headers={**js_hdrs, "Accept":"application/json"},
-                                                  timeout=8)
-                            if r_api.status_code == 200 and r_api.text.strip().startswith(("[","{")):
-                                data  = r_api.json()
-                                codes = set()
-                                def _dig(obj):
-                                    if isinstance(obj, dict):
-                                        for k, v in obj.items():
-                                            if k.lower() in ("stock_id","stockid","code",
-                                                             "股票代號","stock_code","id"):
-                                                s = str(v).strip()
-                                                if re.match(r"^\d{4}$", s): codes.add(s)
-                                                elif re.match(r"^\d{6}$", s): codes.add(s[:4])
-                                            _dig(v)
-                                    elif isinstance(obj, list):
-                                        for item in obj: _dig(item)
-                                _dig(data)
-                                if len(codes) >= 5:
-                                    return codes, f"thefew.tw{ap} ({len(codes)}支)"
-                        except Exception:
-                            continue
-
-                # 策略B: 直接從 JS 找 6碼 CB 代號（前4碼=股票代號，後2碼=期別01-30）
-                cb6 = re.findall(r'["\'](\d{4}(?:0[1-9]|[12]\d|30))["\']', js_txt)
-                codes = set()
-                for s in cb6:
-                    base = s[:4]
-                    if 1000 <= int(base) <= 9999:
-                        codes.add(base)
-                if len(codes) >= 5:
-                    return codes, f"thefew.tw JS ({js_url.split('/')[-1][:20]}, {len(codes)}支)"
-
-            except Exception:
-                continue
-
-    except Exception:
-        pass
-
-    return set(), "所有來源失敗"
-
-# ─────────────────────────────────────────────────────────────────────────────
-# TIME — 台灣時間 UTC+8
 # ─────────────────────────────────────────────────────────────────────────────
 TW_TZ = timezone(timedelta(hours=8))
 
@@ -379,7 +224,6 @@ def _fm_stock_price(date_str: str) -> pd.DataFrame:
         pass
     return pd.DataFrame()
 
-
 def _yf_top30(symbols, name_pool, period_kw: dict) -> tuple:
     """yfinance 備援，回傳 (df, label) 或 (empty, err)"""
     try:
@@ -412,7 +256,6 @@ def _yf_top30(symbols, name_pool, period_kw: dict) -> tuple:
     except Exception as e:
         return pd.DataFrame(), f"yfinance 例外: {e}"
 
-
 @st.cache_data(ttl=170, show_spinner=False)
 def fetch_top30(trade_date: str) -> tuple:
     """盤後成交排行。主：FinMind；備：yfinance。回傳 (df, source)"""
@@ -432,7 +275,6 @@ def fetch_top30(trade_date: str) -> tuple:
     end   = (datetime.strptime(trade_date, "%Y-%m-%d") + timedelta(days=1)).strftime("%Y-%m-%d")
     df, src = _yf_top30(symbols, STOCK_POOL, {"start": start, "end": end})
     return df, src or "yfinance (備援)"
-
 
 @st.cache_data(ttl=170, show_spinner=False)
 def fetch_realtime_top30() -> tuple:
@@ -474,7 +316,6 @@ def _fm_revenue(dataset: str, params: dict) -> list:
         pass
     return []
 
-
 def _calc_yoy(data: list) -> dict:
     """
     從 FinMind TaiwanStockMonthRevenue data list 計算 YoY 和創高。
@@ -512,7 +353,6 @@ def _calc_yoy(data: list) -> dict:
     except Exception:
         return {}
 
-
 @st.cache_data(ttl=7200, show_spinner=False)
 def fetch_revenue_yoy(codes_tuple: tuple) -> dict:
     """
@@ -549,7 +389,6 @@ def fetch_revenue_yoy(codes_tuple: tuple) -> dict:
         time.sleep(0.1)   # 避免超過 FinMind 速率限制
 
     return result
-
 
 # ─────────────────────────────────────────────────────────────────────────────
 # GOOGLE SHEETS
@@ -613,12 +452,11 @@ def load_history(client) -> dict:
 # ─────────────────────────────────────────────────────────────────────────────
 # TABLE — 排行 / 股票名稱 / 漲跌幅 / 成交金額(億)
 # ─────────────────────────────────────────────────────────────────────────────
-def build_table(df, prev_codes, cb_codes, extra=None, revenue_map=None):
+def build_table(df, prev_codes, extra=None, revenue_map=None):
     rows = []
     # 記錄每列的 metadata 供 Styler 使用
     pct_list  = []
     new_list  = []
-    cb_list   = []
     yoy_list  = []
     high_list = []
 
@@ -626,12 +464,9 @@ def build_table(df, prev_codes, cb_codes, extra=None, revenue_map=None):
         code   = str(r["code"]).strip()
         pct    = float(r.get("change_pct") or 0)
         is_new = bool(prev_codes) and (code not in prev_codes)
-        has_cb = code in cb_codes
-        # ★ 前綴表示新上榜，CB 後綴表示可轉債
         base_name = str(r["name"])
         prefix    = "★ " if is_new else ""
-        suffix    = "  CB" if has_cb else ""
-        name      = prefix + base_name + suffix
+        name      = prefix + base_name
 
         # 漲跌幅：只有非零才顯示，避免 yfinance 前後日相同導致誤判為 0
         if pct > 0:
@@ -666,7 +501,6 @@ def build_table(df, prev_codes, cb_codes, extra=None, revenue_map=None):
         rows.append(row_d)
         pct_list.append(pct)
         new_list.append(is_new)
-        cb_list.append(has_cb)
 
     # 只建立「顯示欄位」的 DataFrame，不放 __p/__n
     vis_cols = ["排行", "股票名稱", "漲跌幅", "成交金額(億)", "月營收YoY"]
@@ -688,9 +522,7 @@ def build_table(df, prev_codes, cb_codes, extra=None, revenue_map=None):
         result = []
         for i in range(len(disp)):
             is_n = new_list[i]
-            cb   = cb_list[i]
             if is_n:  result.append("color: #f39c12; font-weight: 700")
-            elif cb:  result.append("color: #a78bfa")
             else:     result.append("color: #c8d6e5")
         return result
 
@@ -752,7 +584,7 @@ def build_table(df, prev_codes, cb_codes, extra=None, revenue_map=None):
 # ─────────────────────────────────────────────────────────────────────────────
 # SHARED UI
 # ─────────────────────────────────────────────────────────────────────────────
-def render_kpi(df, prev_codes, cb_codes):
+def render_kpi(df, prev_codes):
     up=int((df["change_pct"]>0).sum()); dn=int((df["change_pct"]<0).sum()); nc=len(df)-up-dn
     new_c=sum(1 for c in df["code"].astype(str) if prev_codes and c not in prev_codes)
     tot=len(df) or 1; up_p=round(up/tot*100); dn_p=round(dn/tot*100); nc_p=100-up_p-dn_p
@@ -790,7 +622,6 @@ def render_legend():
         <div class="leg"><div class="dot" style="background:#0a3018"></div><span style="color:#2ecc71">下跌</span></div>
         <div class="leg"><div class="dot" style="background:#3a2500"></div>
             <span style="color:#f39c12">★新 = 今日新上榜</span></div>
-        <div class="leg" style="color:#a78bfa">CB = 已發行可轉債</div>
     </div>""", unsafe_allow_html=True)
 
 def _prep_hist(raw):
@@ -854,17 +685,11 @@ def page_realtime():
         st.info("請稍後點「立即刷新」重試，或切換至「🔧 診斷」頁查看詳細錯誤。")
         return
 
-    cb_codes, _cb_src = fetch_cb_stocks()
     client     = gs_client()
     prev_codes = load_prev_codes(client, today_k)
 
     if tw.hour >= 14:
         save_today(client, df, today_k)
-
-    # sidebar 診斷資訊
-    with st.sidebar:
-        st.markdown("---")
-        st.caption(f"**CB資料來源:** {_cb_src}  \n**CB上榜數:** {sum(1 for c in df['code'] if c in cb_codes)}")
 
     with st.spinner("載入月營收資料…"):
         rev_map = fetch_revenue_yoy(tuple(df["code"].astype(str).tolist()))
@@ -874,14 +699,14 @@ def page_realtime():
         rev_ok   = len(rev_map)
         st.caption(f"**FinMind Token:** {'✅ 讀到' if token_ok else '❌ 未讀到'}  \n**月營收筆數:** {rev_ok}/30")
 
-    render_kpi(df, prev_codes, cb_codes)
+    render_kpi(df, prev_codes)
     render_legend()
     st.markdown(
         f'<div class="refresh-info">資料日期: {trade_d} &nbsp;·&nbsp; '
         f'更新: {tw.strftime("%H:%M:%S")} &nbsp;·&nbsp; 每 3 分鐘自動刷新</div>',
         unsafe_allow_html=True)
 
-    st.dataframe(build_table(df, prev_codes, cb_codes, revenue_map=rev_map),
+    st.dataframe(build_table(df, prev_codes, revenue_map=rev_map),
                  use_container_width=True, height=980, hide_index=True)
 
     if not open_:
@@ -901,7 +726,6 @@ def page_history():
 
     client   = gs_client()
     history  = load_history(client)
-    cb_codes, _cb_src = fetch_cb_stocks()
 
     if not history:
         st.warning("尚無歷史資料。請確認 Google Sheets API 已設定，且系統曾在交易日 14:00 後儲存資料。")
@@ -928,44 +752,139 @@ def page_history():
                 try: prev_c=set(_prep_hist(history[all_sorted[idx-1]])["code"].astype(str))
                 except: pass
             with st.expander(f"📅 {date}", expanded=(date==sorted(selected,reverse=True)[0])):
-                render_kpi(df, prev_c, cb_codes)
+                render_kpi(df, prev_c)
                 render_legend()
                 rev_map = fetch_revenue_yoy(tuple(df["code"].astype(str).tolist()))
-                st.dataframe(build_table(df, prev_c, cb_codes, revenue_map=rev_map),
+                st.dataframe(build_table(df, prev_c, revenue_map=rev_map),
                              use_container_width=True, height=600, hide_index=True)
 
     else:
-        all_rows=[]
-        for d in selected:
-            raw=history.get(d)
+        # ── 近5日新上榜觀察表 ──
+        sel_s = sorted(selected)[-5:]   # 最多取最近5天
+
+        # 建立每日 {code: row_dict}
+        daily = {}
+        for d in sel_s:
+            raw = history.get(d)
             if raw is None: continue
-            tmp=_prep_hist(raw); tmp["_d"]=d; all_rows.append(tmp)
-        if not all_rows: st.warning("無有效資料"); return
+            df_d = _prep_hist(raw)
+            daily[d] = {str(r["code"]): r for _, r in df_d.iterrows()}
 
-        combined=pd.concat(all_rows,ignore_index=True)
-        agg=(combined.groupby(["code","name"])
-             .agg(avg_val=("trade_value","mean"),total_val=("trade_value","sum"),
-                  days=("trade_value","count"),  avg_pct=("change_pct","mean"))
-             .reset_index().sort_values("total_val",ascending=False).head(30).reset_index(drop=True))
-        agg["rank"]=range(1,len(agg)+1)
-        agg["trade_value"]=agg["avg_val"]
-        agg["change_pct"] =agg["avg_pct"].round(2)
+        if not daily:
+            st.warning("無有效資料"); return
 
-        sel_s=sorted(selected); prev_c=set()
-        if sel_s[0] in all_sorted:
-            i=all_sorted.index(sel_s[0])
-            if i>0:
-                try: prev_c=set(_prep_hist(history[all_sorted[i-1]])["code"].astype(str))
-                except: pass
+        dates     = sorted(daily.keys())
+        # 依各日出現頻率和成交金額排序
+        code_score = {}
+        for d in dates:
+            for code, r in daily[d].items():
+                tv = float(r.get("trade_value", 0) or 0)
+                code_score[code] = code_score.get(code, 0) + tv
+        all_codes = sorted(code_score.keys(), key=lambda c: -code_score[c])
 
-        period=f"{sel_s[0]} ~ {sel_s[-1]}" if len(sel_s)>1 else sel_s[0]
-        st.markdown(f'<div class="section-title">彙總 · {period} · {len(sel_s)} 交易日</div>',
+        # 找各日前一交易日的 code 集合
+        prev_day = {}
+        for d in dates:
+            idx = all_sorted.index(d) if d in all_sorted else -1
+            if idx > 0:
+                pr = history.get(all_sorted[idx - 1])
+                prev_day[d] = set(_prep_hist(pr)["code"].astype(str)) if pr is not None else set()
+            else:
+                prev_day[d] = set()
+
+        period = f"{dates[0]} ~ {dates[-1]}" if len(dates) > 1 else dates[0]
+        st.markdown(f'<div class="section-title">近 {len(dates)} 日上榜觀察 · {period}</div>',
                     unsafe_allow_html=True)
-        render_legend()
-        extra=[("avg_val","平均成交(億)"),("total_val","累積成交(億)"),("days","上榜天數")]
-        rev_map = fetch_revenue_yoy(tuple(agg["code"].astype(str).tolist()))
-        st.dataframe(build_table(agg, prev_c, cb_codes, extra=extra, revenue_map=rev_map),
-                     use_container_width=True, height=700, hide_index=True)
+        st.markdown("""
+        <div class="legend-strip">
+            <span style="color:#4a6080;font-size:10px;letter-spacing:1px;text-transform:uppercase">圖例</span>
+            <div class="leg"><div class="dot" style="background:#191000"></div>
+                <span style="color:#f39c12">★ 新上榜（前日未在TOP30）</span></div>
+            <div class="leg"><div class="dot" style="background:#4a1212"></div>
+                <span style="color:#e74c3c">▲ 上漲</span></div>
+            <div class="leg"><div class="dot" style="background:#0a3018"></div>
+                <span style="color:#2ecc71">▼ 下跌</span></div>
+            <div class="leg" style="color:#2a3a50">• = 未上榜當日</div>
+        </div>""", unsafe_allow_html=True)
+
+        col_names = ["股票名稱"] + [d[5:] for d in dates] + ["連續天數"]
+        rows, cell_styles = [], []
+
+        for code in all_codes:
+            name = ""
+            for d in dates:
+                if code in daily[d]:
+                    name = str(daily[d][code].get("name", code)); break
+
+            consecutive = 0
+            for d in reversed(dates):
+                if code in daily[d]: consecutive += 1
+                else: break
+
+            row = [name]
+            rs  = {}
+            for ci, d in enumerate(dates, 1):
+                if code in daily[d]:
+                    info   = daily[d][code]
+                    rank   = int(info.get("rank", 99))
+                    pct    = float(info.get("change_pct", 0) or 0)
+                    is_new = code not in prev_day[d]
+                    if pct > 0:   pstr = f"▲{pct:.1f}%"
+                    elif pct < 0: pstr = f"▼{abs(pct):.1f}%"
+                    else:         pstr = "-0.0%"
+                    row.append(f"#{rank} {pstr}")
+                    if is_new:
+                        rs[ci] = "background-color:#191000;color:#f39c12;font-weight:700"
+                    elif pct > 0:
+                        rs[ci] = "background-color:#1a0808;color:#e74c3c"
+                    elif pct < 0:
+                        rs[ci] = "background-color:#041008;color:#2ecc71"
+                    else:
+                        rs[ci] = "color:#5a6a80"
+                else:
+                    row.append("•")
+                    rs[ci] = "color:#2a3a50"
+            row.append(consecutive)
+            rows.append(row)
+            cell_styles.append(rs)
+
+        disp = pd.DataFrame(rows, columns=col_names)
+
+        def apply_styles(df_in):
+            base = "font-family:'IBM Plex Mono',monospace;font-size:12px;border:none"
+            sdf  = pd.DataFrame(base, index=df_in.index, columns=df_in.columns)
+            sdf["股票名稱"] = base + ";color:#c8d6e5;text-align:left"
+            sdf["連續天數"] = base + ";color:#4fc3f7;text-align:center;font-weight:700"
+            for ri, rs in enumerate(cell_styles):
+                for ci, css in rs.items():
+                    col = col_names[ci]
+                    sdf.iloc[ri, df_in.columns.get_loc(col)] = base + ";" + css + ";text-align:center"
+            return sdf
+
+        styled = (
+            disp.style.apply(apply_styles, axis=None)
+            .set_table_styles([
+                {"selector":"thead th","props":[
+                    ("background-color","#0a1520"),("color","#4a6080"),
+                    ("font-family","'IBM Plex Mono',monospace"),("font-size","11px"),
+                    ("letter-spacing","1.5px"),("text-transform","uppercase"),
+                    ("border-bottom","1px solid #1a2940"),("padding","8px 12px")]},
+                {"selector":"tbody td","props":[
+                    ("padding","8px 12px"),("border-bottom","1px solid #0d1a28")]},
+                {"selector":"tbody tr:hover td","props":[("filter","brightness(1.3)")]},
+                {"selector":"table","props":[("width","100%"),("border-collapse","collapse")]},
+            ])
+            .hide(axis="index")
+        )
+        height = min(max(len(disp) * 38 + 50, 400), 900)
+        st.dataframe(styled, use_container_width=True, height=height, hide_index=True)
+
+        # 摘要：最後一天新上榜
+        last_d    = dates[-1]
+        new_today = [c for c in daily.get(last_d, {}) if c not in prev_day.get(last_d, set())]
+        if new_today:
+            names_new = [str(daily[last_d][c].get("name", c)) for c in new_today]
+            st.info(f"📌 {last_d} 新上榜（{len(new_today)}支）：" + "、".join(names_new))
 
 # ─────────────────────────────────────────────────────────────────────────────
 # MAIN
@@ -1039,121 +958,6 @@ def page_diag():
             st.error(f"無資料，完整回傳: {str(d)[:300]}")
     except Exception as e:
         st.error(f"Exception: {e}")
-
-    # ── 2b. CB 來源測試 ──
-    st.markdown("### 2b. FinMind CB datasets")
-    cb_datasets = ["TaiwanStockConvertibleBondInfo","TaiwanStockConvertibleBond",
-                   "TaiwanStockConvertibleBondDetail","TaiwanStockConvertibleBondPremium"]
-    for ds in cb_datasets:
-        try:
-            r = requests.get("https://api.finmindtrade.com/api/v4/data",
-                             params={"dataset":ds,"token":token or ""},timeout=8)
-            d = r.json()
-            msg = f"HTTP={r.status_code} status={d.get('status')} msg={str(d.get('msg',''))[:60]}"
-            if d.get("data"):
-                st.success(f"✅ **{ds}**: {msg} → {len(d['data'])}筆 欄位:{list(pd.DataFrame(d['data']).columns)}")
-            else:
-                st.warning(f"⚠ **{ds}**: {msg}")
-        except Exception as e:
-            st.error(f"❌ **{ds}**: {e}")
-    st.markdown("### 2b-2. TWSE verify=False")
-    import urllib3; urllib3.disable_warnings()
-    for cb_url in [
-        "https://www.twse.com.tw/rwd/zh/cbInfo/CB_OVERVIEW",
-        "https://www.twse.com.tw/rwd/zh/cbInfo/CB_BOND_INFO",
-    ]:
-        try:
-            rv = requests.get(cb_url,
-                headers={"User-Agent": "Mozilla/5.0", "Referer": "https://www.twse.com.tw/"},
-                timeout=12, verify=False)
-            dv = rv.json()
-            ndv = len(dv.get("data", []))
-            st.write(f"**{cb_url.split('/')[-1]}**: HTTP={rv.status_code} stat={dv.get('stat')} 筆數={ndv}")
-            if ndv > 0:
-                st.write("  fields:", dv.get('fields', [])[:5])
-                st.write("  第一筆:", dv['data'][0])
-        except Exception as exc_twse:
-            st.error(f"TWSE CB: {exc_twse}")
-
-    st.markdown("### 2b-3. thefew.tw JS 掃描")
-    try:
-        from bs4 import BeautifulSoup as BS3
-        r3 = requests.get("https://thefew.tw/cb",
-            headers={"User-Agent": "Mozilla/5.0 Chrome/124", "Accept": "text/html"},
-            timeout=12)
-        soup3 = BS3(r3.text, "html.parser")
-        srcs3 = [
-            "https://thefew.tw" + t["src"]
-            for t in soup3.find_all("script", src=True)
-            if "/packs/js/" in t.get("src", "")
-        ]
-        st.write(f"JS 數量: {len(srcs3)}, scripts: {[u.split('/')[-1] for u in srcs3]}")
-        app_js = next((u for u in srcs3 if "application" in u), srcs3[0] if srcs3 else None)
-        if app_js:
-            rj3 = requests.get(app_js,
-                headers={"User-Agent": "Mozilla/5.0", "Referer": "https://thefew.tw/"},
-                timeout=20)
-            jt3 = rj3.text
-            st.write(f"JS 長度: {len(jt3)}")
-            apis3 = sorted(set(re.findall(r'["\'](/api/[a-zA-Z0-9_/-]+)["\'  ]', jt3)))
-            st.write(f"API 路徑 ({len(apis3)}): {apis3[:15]}")
-            stock4 = sorted(set(re.findall(r'(?<![0-9])([1-9][0-9]{3})(?:0[1-9]|[12][0-9]|30)(?![0-9])', jt3)))
-            st.write(f"可能股票代號 ({len(stock4)}): {stock4[:30]}")
-    except Exception as exc3:
-        st.error(f"JS 分析: {exc3}")
-
-    st.markdown("### 2c. fetch_cb_stocks 最終結果")
-    cb_set, cb_src = fetch_cb_stocks()
-    if cb_set:
-        st.success(f"✅ 來源: {cb_src}，共 {len(cb_set)} 支")
-        st.write("前30支：", sorted(cb_set)[:30])
-    else:
-        st.error(f"❌ 失敗: {cb_src}")
-
-    # ── 2c. fetch_cb_stocks 實際結果 ──
-    st.markdown("### 2c. fetch_cb_stocks 實際結果")
-    cb_set, cb_src = fetch_cb_stocks()
-    if cb_set:
-        st.success(f"✅ 來源: {cb_src}，共 {len(cb_set)} 支")
-        st.write("前20支：", sorted(cb_set)[:20])
-    else:
-        st.error(f"❌ 失敗: {cb_src}")
-
-
-    # ── 3. TWSE CB_OVERVIEW ──
-    st.markdown("### 3. TWSE CB_OVERVIEW")
-    try:
-        r = requests.get(
-            "https://www.twse.com.tw/rwd/zh/cbInfo/CB_OVERVIEW",
-            headers={"User-Agent":"Mozilla/5.0","Referer":"https://www.twse.com.tw/"},
-            timeout=15)
-        d = r.json()
-        st.write(f"HTTP: {r.status_code} | stat: {d.get('stat')} | fields: {d.get('fields',[])} ")
-        data = d.get("data",[])
-        st.write(f"筆數: {len(data)}")
-        if data:
-            st.write(f"第一筆: {data[0]}")
-        else:
-            st.error(f"無資料: {str(d)[:300]}")
-    except Exception as e:
-        st.error(f"Exception: {e}")
-
-    # ── 4. TWSE CB_BOND_INFO ──
-    st.markdown("### 4. TWSE CB_BOND_INFO")
-    try:
-        r = requests.get(
-            "https://www.twse.com.tw/rwd/zh/cbInfo/CB_BOND_INFO",
-            headers={"User-Agent":"Mozilla/5.0","Referer":"https://www.twse.com.tw/"},
-            timeout=15)
-        d = r.json()
-        st.write(f"HTTP: {r.status_code} | stat: {d.get('stat')}")
-        data = d.get("data",[])
-        st.write(f"筆數: {len(data)}")
-        if data: st.write(f"第一筆: {data[0]}")
-        else: st.error(str(d)[:300])
-    except Exception as e:
-        st.error(f"Exception: {e}")
-
     # ── 5. thefew.tw/cb ──
     st.markdown("### 5. thefew.tw/cb")
     try:
@@ -1187,7 +991,6 @@ def page_diag():
         st.error(f"Exception: {e}")
 
     st.success("診斷完成！請將以上結果截圖。")
-
 
 def main():
     page = st.radio("nav", ["📈  即時排行","📊  歷史排行","🔧  診斷"],
