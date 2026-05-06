@@ -162,104 +162,113 @@ def fetch_name_map() -> dict:
 
 # ─────────────────────────────────────────────────────────────────────────────
 # CB 可轉債資料
-# 來源1: FinMind（嘗試多個正確的 dataset 名稱）
-# 來源2: thefew.tw/cb（爬蟲，備援）
 # ─────────────────────────────────────────────────────────────────────────────
 @st.cache_data(ttl=3600, show_spinner=False)
 def fetch_cb_stocks() -> tuple:
-    """回傳 (codes_set, source_label)"""
-    token = _read_token()
+    """
+    回傳 (codes_set, source_label)
 
-    # ── 來源1: FinMind（試多個 dataset 名稱）──
+    來源1: FinMind TaiwanStockConvertibleBondInfo（需付費帳號）
+    來源2: thefew.tw API endpoints（JSON）
+    來源3: thefew.tw HTML 解析（掃 6碼CB代號取前4碼）
+    """
+    token = _read_token()
+    FM_BASE = "https://api.finmindtrade.com/api/v4/data"
+
+    # ── 來源1: FinMind（需升級帳號，但仍嘗試）──
     if token:
-        FM_BASE = "https://api.finmindtrade.com/api/v4/data"
-        # FinMind 正確的 CB dataset 名稱候選（依官方文件）
-        cb_datasets = [
-            "TaiwanStockConvertibleBondInfo",
-            "TaiwanStockConvertibleBond",
-            "TaiwanStockConvertibleBondDetail",
-            "TaiwanStockConvertibleBondPremium",
-        ]
-        for ds in cb_datasets:
+        for ds in ["TaiwanStockConvertibleBondInfo",
+                   "TaiwanStockConvertibleBondDetail",
+                   "TaiwanStockConvertibleBondPremium"]:
             try:
-                r   = requests.get(FM_BASE,
-                                   params={"dataset": ds, "token": token},
-                                   timeout=12)
+                r   = requests.get(FM_BASE, params={"dataset": ds, "token": token}, timeout=10)
                 raw = r.json()
-                status = int(str(raw.get("status", 0)))
-                if status == 200 and raw.get("data"):
-                    df = pd.DataFrame(raw["data"])
+                if int(str(raw.get("status", 0))) == 200 and raw.get("data"):
+                    df    = pd.DataFrame(raw["data"])
                     codes = set()
-                    # 掃所有欄找 4 碼或 6 碼數字
                     for col in df.columns:
                         for v in df[col].astype(str):
                             s = v.strip()
-                            if re.match(r"^\d{4}$", s):
-                                codes.add(s)
-                            elif re.match(r"^\d{6}$", s):
-                                codes.add(s[:4])  # CB代號前4碼=股票代號
+                            if re.match(r"^\d{4}$", s): codes.add(s)
+                            elif re.match(r"^\d{6}$", s): codes.add(s[:4])
                     if len(codes) >= 5:
-                        return codes, f"FinMind {ds} ({len(codes)} 支)"
+                        return codes, f"FinMind {ds} ({len(codes)}支)"
             except Exception:
                 continue
 
-    # ── 來源2: thefew.tw/cb ──
+    # ── 來源2: thefew.tw JSON API（試多個 endpoint）──
+    thefew_hdrs = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/124",
+        "Accept": "application/json, text/plain, */*",
+        "Referer": "https://thefew.tw/",
+        "Origin":  "https://thefew.tw",
+    }
+    for path in ["/api/cb", "/api/cb-list", "/api/cb-stocks",
+                 "/api/convertible-bonds", "/api/stocks/cb",
+                 "/api/cb-data", "/api/bond/cb"]:
+        try:
+            r = requests.get(f"https://thefew.tw{path}",
+                             headers=thefew_hdrs, timeout=10)
+            if r.status_code == 200:
+                try:
+                    data = r.json()
+                    codes = set()
+                    # 遞迴搜尋所有值
+                    def _dig(obj):
+                        if isinstance(obj, dict):
+                            for k, v in obj.items():
+                                if k.lower() in ("stock_id","stockid","code","股票代號",
+                                                 "stock_code","underlying"):
+                                    s = str(v).strip()
+                                    if re.match(r"^\d{4}$", s): codes.add(s)
+                                    elif re.match(r"^\d{6}$", s): codes.add(s[:4])
+                                _dig(v)
+                        elif isinstance(obj, list):
+                            for item in obj: _dig(item)
+                    _dig(data)
+                    if len(codes) >= 5:
+                        return codes, f"thefew.tw{path} ({len(codes)}支)"
+                except Exception:
+                    pass
+        except Exception:
+            continue
+
+    # ── 來源3: thefew.tw HTML — 掃 6碼 CB 代號（如 123401），前4碼是股票代號 ──
+    # thefew.tw 顯示的是可轉債清單，CB 代號格式：股票代號(4碼) + 期別(2碼)
+    # 例：台積電可轉債 = 233001, 233002...  → 股票代號 2330
     try:
         from bs4 import BeautifulSoup
-        import json as _json
-
-        headers = {
-            "User-Agent": (
-                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                "AppleWebKit/537.36 (KHTML, like Gecko) "
-                "Chrome/124.0.0.0 Safari/537.36"
-            ),
-            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-            "Accept-Language": "zh-TW,zh;q=0.9,en-US;q=0.8",
-            "Accept-Encoding": "gzip, deflate, br",
-            "Connection": "keep-alive",
-            "Upgrade-Insecure-Requests": "1",
+        html_hdrs = {
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/124",
+            "Accept": "text/html,application/xhtml+xml;q=0.9,*/*;q=0.8",
+            "Accept-Language": "zh-TW,zh;q=0.9",
         }
-        r    = requests.get("https://thefew.tw/cb", headers=headers, timeout=15)
+        r    = requests.get("https://thefew.tw/cb", headers=html_hdrs, timeout=15)
         soup = BeautifulSoup(r.text, "html.parser")
         codes = set()
 
-        # 嘗試 1：Next.js __NEXT_DATA__
-        nd = soup.find("script", {"id": "__NEXT_DATA__"})
-        if nd:
-            def _dig(obj):
-                if isinstance(obj, dict):
-                    for k, v in obj.items():
-                        if k.lower() in ("stock_id","stockid","code","股票代號","id","stockcode"):
-                            s = str(v).strip()
-                            if re.match(r"^\d{4}$", s): codes.add(s)
-                            elif re.match(r"^\d{6}$", s): codes.add(s[:4])
-                        _dig(v)
-                elif isinstance(obj, list):
-                    for item in obj: _dig(item)
-                elif isinstance(obj, str):
-                    s = obj.strip()
-                    if re.match(r"^\d{4}$", s): codes.add(s)
-                    elif re.match(r"^\d{6}$", s): codes.add(s[:4])
-            _dig(_json.loads(nd.string))
+        # 取所有文字節點，找 6碼數字（CB代號）→ 前4碼為股票代號
+        # 排除 4碼但避免收到非股票的數字（年份、頁碼等）
+        all_text = soup.get_text(" ", strip=True)
 
-        # 嘗試 2：掃描 <td>/<span>/<div> 內的純4碼數字
-        if not codes:
-            for tag in soup.find_all(["td", "span", "div", "a", "li"]):
-                txt = tag.get_text(strip=True)
-                if re.match(r"^\d{4}$", txt):
-                    codes.add(txt)
-                elif re.match(r"^\d{6}$", txt):
-                    codes.add(txt[:4])
+        # 6碼 CB 代號：第1~4碼是股票代號，第5~6碼是期別(01~99)
+        # 台灣上市股票代號範圍：1000-9999
+        cb_pattern = re.finditer(r'(\d{4})(0[1-9]|[1-9]\d)', all_text)
+        for m in cb_pattern:
+            stock_code = m.group(1)
+            # 合理的股票代號範圍（排除年份等）
+            if 1000 <= int(stock_code) <= 9999:
+                codes.add(stock_code)
 
-        # 嘗試 3：抓 href 中的股票代號
-        if not codes:
-            for a in soup.find_all("a", href=True):
-                m = re.search(r"/(\d{4})(?:/|$)", a["href"])
-                if m: codes.add(m.group(1))
+        # 也掃 data 屬性
+        for tag in soup.find_all(True):
+            for attr in ["data-stock", "data-id", "data-code", "data-stock-id"]:
+                val = str(tag.get(attr, "")).strip()
+                if re.match(r"^\d{4}$", val): codes.add(val)
+                elif re.match(r"^\d{6}$", val): codes.add(val[:4])
 
         if len(codes) >= 5:
-            return codes, f"thefew.tw ({len(codes)} 支)"
+            return codes, f"thefew.tw HTML ({len(codes)}支)"
     except Exception:
         pass
 
@@ -995,27 +1004,42 @@ def page_diag():
     except Exception as e:
         st.error(f"Exception: {e}")
 
-    # ── 2b. FinMind CB datasets 嘗試 ──
+    # ── 2b. CB 來源測試 ──
     st.markdown("### 2b. FinMind CB datasets")
-    cb_datasets = [
-        "TaiwanStockConvertibleBondInfo",
-        "TaiwanStockConvertibleBond",
-        "TaiwanStockConvertibleBondDetail",
-        "TaiwanStockConvertibleBondPremium",
-    ]
+    cb_datasets = ["TaiwanStockConvertibleBondInfo","TaiwanStockConvertibleBond",
+                   "TaiwanStockConvertibleBondDetail","TaiwanStockConvertibleBondPremium"]
     for ds in cb_datasets:
         try:
             r = requests.get("https://api.finmindtrade.com/api/v4/data",
-                             params={"dataset": ds, "token": token or ""},
-                             timeout=10)
+                             params={"dataset":ds,"token":token or ""},timeout=8)
             d = r.json()
-            st.write(f"**{ds}**: HTTP={r.status_code} status={d.get('status')} msg={str(d.get('msg',''))[:80]}")
+            msg = f"HTTP={r.status_code} status={d.get('status')} msg={str(d.get('msg',''))[:60]}"
             if d.get("data"):
-                df_t = pd.DataFrame(d["data"])
-                st.write(f"  → 筆數:{len(df_t)} 欄位:{list(df_t.columns)}")
-                st.dataframe(df_t.head(3))
+                st.success(f"✅ **{ds}**: {msg} → {len(d['data'])}筆 欄位:{list(pd.DataFrame(d['data']).columns)}")
+            else:
+                st.warning(f"⚠ **{ds}**: {msg}")
         except Exception as e:
-            st.write(f"**{ds}**: Exception {e}")
+            st.error(f"❌ **{ds}**: {e}")
+
+    st.markdown("### 2b-2. thefew.tw API endpoints")
+    for path in ["/api/cb","/api/cb-list","/api/cb-stocks","/api/convertible-bonds","/api/bond/cb"]:
+        try:
+            r = requests.get(f"https://thefew.tw{path}",
+                headers={"User-Agent":"Mozilla/5.0","Accept":"application/json","Referer":"https://thefew.tw/"},
+                timeout=8)
+            st.write(f"**{path}**: HTTP={r.status_code} Content-Type={r.headers.get('content-type','?')} 長度={len(r.text)}")
+            if r.status_code == 200 and 'json' in r.headers.get('content-type',''):
+                st.json(r.json())
+        except Exception as e:
+            st.write(f"**{path}**: {e}")
+
+    st.markdown("### 2c. fetch_cb_stocks 最終結果")
+    cb_set, cb_src = fetch_cb_stocks()
+    if cb_set:
+        st.success(f"✅ 來源: {cb_src}，共 {len(cb_set)} 支")
+        st.write("前30支：", sorted(cb_set)[:30])
+    else:
+        st.error(f"❌ 失敗: {cb_src}")
 
     # ── 2c. fetch_cb_stocks 實際結果 ──
     st.markdown("### 2c. fetch_cb_stocks 實際結果")
