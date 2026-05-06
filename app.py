@@ -168,14 +168,52 @@ def fetch_cb_stocks() -> tuple:
     """
     回傳 (codes_set, source_label)
 
-    thefew.tw 是 React SPA，資料透過 JS fetch 載入。
-    策略：先取 HTML，找 script bundle URL，
-    再從 JS bundle 中搜尋 API endpoint，最後呼叫該 endpoint。
-    同時嘗試 FinMind（需付費）。
+    來源1: TWSE CB_OVERVIEW / CB_BOND_INFO（verify=False 繞 SSL）
+    來源2: FinMind（需付費，留著備用）
+    來源3: thefew.tw JS bundle（Rails app，掃 application-*.js）
     """
-    token = _read_token()
+    import urllib3
+    urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
-    # ── 來源1: FinMind（需付費，留著以防升級）──
+    TWSE_H = {"User-Agent": "Mozilla/5.0", "Referer": "https://www.twse.com.tw/"}
+
+    # ── 來源1: TWSE（verify=False 繞過 SSL 憑證錯誤）──
+    for url in [
+        "https://www.twse.com.tw/rwd/zh/cbInfo/CB_OVERVIEW",
+        "https://www.twse.com.tw/rwd/zh/cbInfo/CB_BOND_INFO",
+    ]:
+        try:
+            r = requests.get(url, headers=TWSE_H, timeout=15, verify=False)
+            d = r.json()
+            if d.get("stat") == "OK" and d.get("data"):
+                fields = d.get("fields", [])
+                # 找股票代號欄的 index
+                stock_idx = None
+                for idx, f in enumerate(fields):
+                    if any(k in str(f) for k in ["股票代號","標的","證券代號"]):
+                        stock_idx = idx
+                        break
+                codes = set()
+                for row in d["data"]:
+                    # 優先用股票代號欄
+                    if stock_idx is not None:
+                        try:
+                            s = str(row[stock_idx]).strip()
+                            if re.match(r"^\d{4}$", s): codes.add(s)
+                        except Exception:
+                            pass
+                    # 掃所有欄：4碼直接用，6碼取前4碼
+                    for cell in row:
+                        s = str(cell).strip()
+                        if re.match(r"^\d{4}$", s): codes.add(s)
+                        elif re.match(r"^\d{6}$", s): codes.add(s[:4])
+                if len(codes) >= 5:
+                    return codes, f"TWSE {url.split('/')[-1]} ({len(codes)}支)"
+        except Exception:
+            pass
+
+    # ── 來源2: FinMind（需付費帳號）──
+    token = _read_token()
     if token:
         for ds in ["TaiwanStockConvertibleBondInfo",
                    "TaiwanStockConvertibleBondDetail"]:
@@ -196,124 +234,77 @@ def fetch_cb_stocks() -> tuple:
             except Exception:
                 continue
 
-    # ── 來源2: thefew.tw — 從 JS bundle 找 API endpoint ──
+    # ── 來源3: thefew.tw JS bundle（Rails app） ──
     try:
         from bs4 import BeautifulSoup
-
-        base_hdrs = {
+        js_hdrs = {
             "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/124",
-            "Accept-Language": "zh-TW,zh;q=0.9",
+            "Referer": "https://thefew.tw/",
+            "Accept": "*/*",
         }
+        html_hdrs = {**js_hdrs, "Accept": "text/html"}
 
-        # Step1: 取 HTML，找所有 <script src>
-        r_html = requests.get("https://thefew.tw/cb",
-                              headers={**base_hdrs, "Accept": "text/html"},
-                              timeout=15)
+        r_html = requests.get("https://thefew.tw/cb", headers=html_hdrs, timeout=15)
         soup   = BeautifulSoup(r_html.text, "html.parser")
 
-        # 找 main JS bundle（通常是 _next/static/chunks/pages/cb-*.js）
-        script_srcs = []
+        # 取所有 /packs/js/*.js 的 script src（Rails Webpacker 格式）
+        all_scripts = []
         for tag in soup.find_all("script", src=True):
             s = tag["src"]
-            if "cb" in s.lower() or "main" in s.lower() or "chunk" in s.lower():
-                if s.startswith("/"):
-                    s = "https://thefew.tw" + s
-                script_srcs.append(s)
+            if "/packs/js/" in s or s.endswith(".js"):
+                url = f"https://thefew.tw{s}" if s.startswith("/") else s
+                all_scripts.append(url)
 
-        # Step2: 掃 JS bundle 找 fetch/axios URL
-        api_endpoints = set()
-        for js_url in script_srcs[:5]:
+        # 優先掃 application-*.js（最大 bundle，包含所有路由和 API call）
+        all_scripts.sort(key=lambda u: (0 if "application" in u else
+                                         1 if "522" in u or "918" in u else 2))
+
+        for js_url in all_scripts[:6]:
             try:
-                r_js = requests.get(js_url,
-                                    headers={**base_hdrs, "Accept": "*/*",
-                                             "Referer": "https://thefew.tw/"},
-                                    timeout=10)
-                js_text = r_js.text
-                # 找 /api/ 路徑
-                found = re.findall(r'"(/api/[a-zA-Z0-9/_-]+)"', js_text)
-                api_endpoints.update(found)
-                # 找外部 API URL
-                ext = re.findall(r'"(https?://[^"]+/api/[^"]+)"', js_text)
-                api_endpoints.update(ext)
-            except Exception:
-                continue
+                r_js   = requests.get(js_url, headers=js_hdrs, timeout=15)
+                js_txt = r_js.text
 
-        # Step3: 嘗試找到的 API endpoint
-        for ep in api_endpoints:
-            if any(k in ep.lower() for k in ["cb", "bond", "convert"]):
-                url = ep if ep.startswith("http") else f"https://thefew.tw{ep}"
-                try:
-                    r_api = requests.get(url,
-                                         headers={**base_hdrs, "Accept": "application/json",
-                                                  "Referer": "https://thefew.tw/"},
-                                         timeout=10)
-                    if r_api.status_code == 200:
-                        data = r_api.json()
-                        codes = set()
-                        def _dig(obj):
-                            if isinstance(obj, dict):
-                                for k, v in obj.items():
-                                    if k.lower() in ("stock_id","stockid","code",
-                                                     "股票代號","stock_code"):
-                                        s = str(v).strip()
-                                        if re.match(r"^\d{4}$", s): codes.add(s)
-                                        elif re.match(r"^\d{6}$", s): codes.add(s[:4])
-                                    _dig(v)
-                            elif isinstance(obj, list):
-                                for item in obj: _dig(item)
-                        _dig(data)
-                        if len(codes) >= 5:
-                            return codes, f"thefew.tw API ({len(codes)}支)"
-                except Exception:
-                    continue
+                # 策略A: 找 API 路徑，呼叫取 JSON
+                api_paths = list(set(re.findall(r'["\'](/api/[a-zA-Z0-9_/-]+)["\']', js_txt)))
+                for ap in api_paths:
+                    if any(k in ap.lower() for k in ["cb","bond","convert","stock"]):
+                        try:
+                            r_api = requests.get(f"https://thefew.tw{ap}",
+                                                  headers={**js_hdrs, "Accept":"application/json"},
+                                                  timeout=8)
+                            if r_api.status_code == 200 and r_api.text.strip().startswith(("[","{")):
+                                data  = r_api.json()
+                                codes = set()
+                                def _dig(obj):
+                                    if isinstance(obj, dict):
+                                        for k, v in obj.items():
+                                            if k.lower() in ("stock_id","stockid","code",
+                                                             "股票代號","stock_code","id"):
+                                                s = str(v).strip()
+                                                if re.match(r"^\d{4}$", s): codes.add(s)
+                                                elif re.match(r"^\d{6}$", s): codes.add(s[:4])
+                                            _dig(v)
+                                    elif isinstance(obj, list):
+                                        for item in obj: _dig(item)
+                                _dig(data)
+                                if len(codes) >= 5:
+                                    return codes, f"thefew.tw{ap} ({len(codes)}支)"
+                        except Exception:
+                            continue
 
-        # Step4: 若沒找到 API，從 JS bundle 直接解析 CB 代號清單
-        # 有些 SPA 會把靜態資料直接打包在 JS 裡（如 ["2330","2454",...]）
-        for js_url in script_srcs[:5]:
-            try:
-                r_js = requests.get(js_url,
-                                    headers={**base_hdrs, "Accept": "*/*"},
-                                    timeout=10)
-                js_text = r_js.text
-                # 找 6碼 CB 代號群（如 ["123401","233001","246801"...]）
-                six_digit = re.findall(r'"(\d{6})"', js_text)
-                # CB代號：前2碼在10-99（上市代號），後2碼01-20（期次）
+                # 策略B: 直接從 JS 找 6碼 CB 代號（前4碼=股票代號，後2碼=期別01-30）
+                cb6 = re.findall(r'["\'](\d{4}(?:0[1-9]|[12]\d|30))["\']', js_txt)
                 codes = set()
-                for s in six_digit:
+                for s in cb6:
                     base = s[:4]
-                    seq  = s[4:]
-                    if (re.match(r"^\d{4}$", base) and
-                        1000 <= int(base) <= 9999 and
-                        1 <= int(seq) <= 30):
+                    if 1000 <= int(base) <= 9999:
                         codes.add(base)
                 if len(codes) >= 5:
-                    return codes, f"thefew.tw JS bundle ({len(codes)}支)"
+                    return codes, f"thefew.tw JS ({js_url.split('/')[-1][:20]}, {len(codes)}支)"
+
             except Exception:
                 continue
 
-    except Exception:
-        pass
-
-    # ── 來源3: TWSE CB（加 verify=False 繞過 SSL 錯誤）──
-    try:
-        import urllib3
-        urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
-        for url in ["https://www.twse.com.tw/rwd/zh/cbInfo/CB_OVERVIEW",
-                    "https://www.twse.com.tw/rwd/zh/cbInfo/CB_BOND_INFO"]:
-            r = requests.get(url,
-                             headers={"User-Agent":"Mozilla/5.0",
-                                      "Referer":"https://www.twse.com.tw/"},
-                             timeout=12, verify=False)
-            d = r.json()
-            if d.get("stat") == "OK" and d.get("data"):
-                codes = set()
-                for row in d["data"]:
-                    for cell in row:
-                        s = str(cell).strip()
-                        if re.match(r"^\d{4}$", s): codes.add(s)
-                        elif re.match(r"^\d{6}$", s): codes.add(s[:4])
-                if len(codes) >= 5:
-                    return codes, f"TWSE ({len(codes)}支)"
     except Exception:
         pass
 
@@ -1065,32 +1056,51 @@ def page_diag():
                 st.warning(f"⚠ **{ds}**: {msg}")
         except Exception as e:
             st.error(f"❌ **{ds}**: {e}")
-    st.markdown("### 2b-2. thefew.tw script 分析")
+    st.markdown("### 2b-2. TWSE verify=False")
+    import urllib3; urllib3.disable_warnings()
+    for cb_url in [
+        "https://www.twse.com.tw/rwd/zh/cbInfo/CB_OVERVIEW",
+        "https://www.twse.com.tw/rwd/zh/cbInfo/CB_BOND_INFO",
+    ]:
+        try:
+            rv = requests.get(cb_url,
+                headers={"User-Agent": "Mozilla/5.0", "Referer": "https://www.twse.com.tw/"},
+                timeout=12, verify=False)
+            dv = rv.json()
+            ndv = len(dv.get("data", []))
+            st.write(f"**{cb_url.split('/')[-1]}**: HTTP={rv.status_code} stat={dv.get('stat')} 筆數={ndv}")
+            if ndv > 0:
+                st.write("  fields:", dv.get('fields', [])[:5])
+                st.write("  第一筆:", dv['data'][0])
+        except Exception as exc_twse:
+            st.error(f"TWSE CB: {exc_twse}")
+
+    st.markdown("### 2b-3. thefew.tw JS 掃描")
     try:
-        from bs4 import BeautifulSoup as BS2
-        r2 = requests.get("https://thefew.tw/cb",
-            headers={"User-Agent":"Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/124",
-                     "Accept":"text/html"}, timeout=12)
-        soup2 = BS2(r2.text, "html.parser")
-        scripts = [t["src"] for t in soup2.find_all("script", src=True)]
-        st.write(f"找到 {len(scripts)} 個 script src：")
-        for s2 in scripts[:10]: st.write(f"  {s2}")
-
-        cb_scripts = [s2 for s2 in scripts if any(k in s2.lower() for k in ["cb","pages","main","chunk"])]
-        st.write(f"CB相關 scripts: {cb_scripts[:5]}")
-
-        for js_url in cb_scripts[:3]:
-            url2 = f"https://thefew.tw{js_url}" if js_url.startswith("/") else js_url
-            try:
-                rj = requests.get(url2, headers={"User-Agent":"Mozilla/5.0","Referer":"https://thefew.tw/"}, timeout=10)
-                jt = rj.text
-                apis = list(set(re.findall(r'"(/api/[a-zA-Z0-9/_-]+)"', jt)))
-                six  = list(set(re.findall(r'"\d{6}"', jt)))[:20]
-                st.write(f"**{js_url}** (長度:{len(jt)}) API路徑:{apis[:5]} 6碼數字範例:{six[:10]}")
-            except Exception as je:
-                st.write(f"**{js_url}** 錯誤: {je}")
-    except Exception as e2:
-        st.error(f"分析失敗: {e2}")
+        from bs4 import BeautifulSoup as BS3
+        r3 = requests.get("https://thefew.tw/cb",
+            headers={"User-Agent": "Mozilla/5.0 Chrome/124", "Accept": "text/html"},
+            timeout=12)
+        soup3 = BS3(r3.text, "html.parser")
+        srcs3 = [
+            "https://thefew.tw" + t["src"]
+            for t in soup3.find_all("script", src=True)
+            if "/packs/js/" in t.get("src", "")
+        ]
+        st.write(f"JS 數量: {len(srcs3)}, scripts: {[u.split('/')[-1] for u in srcs3]}")
+        app_js = next((u for u in srcs3 if "application" in u), srcs3[0] if srcs3 else None)
+        if app_js:
+            rj3 = requests.get(app_js,
+                headers={"User-Agent": "Mozilla/5.0", "Referer": "https://thefew.tw/"},
+                timeout=20)
+            jt3 = rj3.text
+            st.write(f"JS 長度: {len(jt3)}")
+            apis3 = sorted(set(re.findall(r'["\'](/api/[a-zA-Z0-9_/-]+)["\'  ]', jt3)))
+            st.write(f"API 路徑 ({len(apis3)}): {apis3[:15]}")
+            stock4 = sorted(set(re.findall(r'(?<![0-9])([1-9][0-9]{3})(?:0[1-9]|[12][0-9]|30)(?![0-9])', jt3)))
+            st.write(f"可能股票代號 ({len(stock4)}): {stock4[:30]}")
+    except Exception as exc3:
+        st.error(f"JS 分析: {exc3}")
 
     st.markdown("### 2c. fetch_cb_stocks 最終結果")
     cb_set, cb_src = fetch_cb_stocks()
