@@ -682,7 +682,7 @@ def page_realtime():
 
     if df is None or len(df) == 0:
         st.error(f"❌ 資料載入失敗: {data_src}")
-        st.info("請稍後點「立即刷新」重試，或切換至「🔧 診斷」頁查看詳細錯誤。")
+        st.info("請稍後點「立即刷新」重試。")
         return
 
     client     = gs_client()
@@ -693,7 +693,7 @@ def page_realtime():
 
     with st.spinner("載入月營收資料…"):
         rev_map = fetch_revenue_yoy(tuple(df["code"].astype(str).tolist()))
-    # 顯示月營收診斷
+    # 月營收
     with st.sidebar:
         token_ok = bool(_read_token())
         rev_ok   = len(rev_map)
@@ -988,116 +988,11 @@ def page_history():
 
 # ─────────────────────────────────────────────────────────────────────────────
 # MAIN
-# ─────────────────────────────────────────────────────────────────────────────
-def page_diag():
-    """API 診斷頁面 — 直接顯示原始 API 回傳結果"""
-    tw = tw_now()
-    st.markdown("## 🔧 API 診斷")
-    st.caption(f"台灣時間: {tw.strftime('%Y-%m-%d %H:%M:%S')} | 查詢交易日: {last_trade_date()}")
-
-    token = _read_token()
-    st.info(f"**FinMind Token 狀態:** {'✅ 讀到 (長度 ' + str(len(token)) + ')' if token else '❌ 未讀到 — 請確認 secrets.toml 格式'}")
-    if token:
-        st.code(f"Token 前 30 碼: {token[:30]}...", language=None)
-
-    if not st.button("▶ 執行診斷（點擊開始）", type="primary"):
-        st.info("點擊按鈕開始測試所有 API")
-        return
-
-    # ── 1. FinMind Token 驗證 ──
-    st.markdown("### 1. FinMind Token 驗證")
-    try:
-        r = requests.get(
-            "https://api.finmindtrade.com/api/v4/user_info",
-            params={"token": token} if token else {},
-            timeout=10)
-        d = r.json()
-        st.write(f"HTTP: {r.status_code}")
-        st.json(d)
-    except Exception as e:
-        st.error(f"Exception: {e}")
-
-    # ── 1b. FinMind TaiwanStockPrice（台達電 2308，查看 spread 欄位）──
-    st.markdown("### 1b. FinMind TaiwanStockPrice - 台達電 (2308)")
-    try:
-        import datetime as _dt
-        test_date = (tw - _dt.timedelta(days=3 if tw.weekday() < 3 else tw.weekday()-1)).strftime("%Y-%m-%d")
-        r = requests.get("https://api.finmindtrade.com/api/v4/data",
-                         params={"dataset":"TaiwanStockPrice","data_id":"2308",
-                                 "start_date": test_date, "token": token or ""},
-                         timeout=15)
-        d = r.json()
-        st.write(f"HTTP:{r.status_code} status:{d.get('status')} date:{test_date}")
-        if d.get("data"):
-            df_tmp = pd.DataFrame(d["data"])
-            st.write(f"欄位: {list(df_tmp.columns)}")
-            st.dataframe(df_tmp[["date","stock_id","close","spread","open","max","min"] 
-                                 if all(c in df_tmp.columns for c in ["open","max","min"]) 
-                                 else df_tmp.columns.tolist()])
-        else:
-            st.error(str(d)[:300])
-    except Exception as e:
-        st.error(f"Exception: {e}")
-
-    # ── 2. FinMind 月營收（台積電 2330）──
-    st.markdown("### 2. FinMind TaiwanStockMonthRevenue (2330)")
-    start = (tw - timedelta(days=430)).strftime("%Y-%m-%d")
-    try:
-        params = {"dataset":"TaiwanStockMonthRevenue","data_id":"2330","start_date":start}
-        if token: params["token"] = token
-        r = requests.get("https://api.finmindtrade.com/api/v4/data", params=params, timeout=15)
-        d = r.json()
-        st.write(f"HTTP: {r.status_code} | status: {d.get('status')} | msg: {d.get('msg','')}")
-        data = d.get("data",[])
-        st.write(f"筆數: {len(data)}")
-        if data:
-            df_tmp = pd.DataFrame(data)
-            st.write(f"欄位: {list(df_tmp.columns)}")
-            st.dataframe(df_tmp.tail(5))
-        else:
-            st.error(f"無資料，完整回傳: {str(d)[:300]}")
-    except Exception as e:
-        st.error(f"Exception: {e}")
-    # ── 5. thefew.tw/cb ──
-    st.markdown("### 5. thefew.tw/cb")
-    try:
-        r = requests.get("https://thefew.tw/cb",
-            headers={"User-Agent":"Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/124",
-                     "Accept":"text/html,application/xhtml+xml;q=0.9,*/*;q=0.8"},
-            timeout=15)
-        st.write(f"HTTP: {r.status_code} | Content-Type: {r.headers.get('content-type','?')} | 長度: {len(r.text)}")
-        # 找 __NEXT_DATA__
-        import json as _j
-        from bs4 import BeautifulSoup
-        soup = BeautifulSoup(r.text, "html.parser")
-        nd = soup.find("script", {"id":"__NEXT_DATA__"})
-        if nd:
-            data = _j.loads(nd.string)
-            st.success(f"✅ 找到 __NEXT_DATA__，keys: {list(data.keys())[:5]}")
-        else:
-            st.warning("❌ 未找到 __NEXT_DATA__")
-            st.code(r.text[:500], language="html")
-    except Exception as e:
-        st.error(f"Exception: {e}")
-
-    # ── 6. yfinance 台積電測試 ──
-    st.markdown("### 6. yfinance 2330.TW")
-    try:
-        import yfinance as yf
-        t = yf.Ticker("2330.TW")
-        info = t.fast_info
-        st.success(f"✅ lastPrice={info.last_price:.2f}, shares={info.shares:,.0f}")
-    except Exception as e:
-        st.error(f"Exception: {e}")
-
-    st.success("診斷完成！請將以上結果截圖。")
-
 def main():
-    page = st.radio("nav", ["📈  即時排行","📊  歷史排行","🔧  診斷"],
+    page = st.radio("nav", ["📈  即時排行","📊  歷史排行"],
                     horizontal=True, label_visibility="collapsed")
-    if "即時" in page:   page_realtime()
-    elif "歷史" in page: page_history()
-    else:                page_diag()
+    if "即時" in page: page_realtime()
+    else:              page_history()
 
 if __name__ == "__main__":
     main()
