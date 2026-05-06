@@ -228,7 +228,7 @@ def _yf_top30(symbols, name_pool, period_kw: dict) -> tuple:
     """yfinance 備援，回傳 (df, label) 或 (empty, err)"""
     try:
         raw = yf.download(tickers=symbols, auto_adjust=True, progress=False,
-                          threads=True, **period_kw)
+                          threads=False, **period_kw)
         if raw.empty:
             return pd.DataFrame(), "yfinance 無資料"
         close_df  = raw["Close"].iloc[-1]
