@@ -796,25 +796,26 @@ def page_history():
         st.markdown("""
         <div class="legend-strip">
             <span style="color:#4a6080;font-size:10px;letter-spacing:1px;text-transform:uppercase">圖例</span>
-            <div class="leg"><div class="dot" style="background:#2a1800"></div>
-                <span style="color:#f39c12">★ 新上榜（前日未在TOP30）</span></div>
-            <div class="leg"><div class="dot" style="background:#1a0808"></div>
-                <span style="color:#e74c3c">▲ 上漲</span></div>
-            <div class="leg"><div class="dot" style="background:#041008"></div>
-                <span style="color:#2ecc71">▼ 下跌</span></div>
+            <div class="leg"><span style="color:#f39c12;font-weight:700">★</span>
+                <span style="color:#f39c12">= 新上榜（前日未在TOP30，粗體顯示）</span></div>
+            <div class="leg"><span style="color:#e74c3c">▲ 上漲（紅）</span></div>
+            <div class="leg"><span style="color:#2ecc71">▼ 下跌（綠）</span></div>
         </div>""", unsafe_allow_html=True)
 
         # ── 建立橫向表格：每欄一天，每列一個排名位置（1~30）──
         max_rows = max(len(df_d) for df_d in daily.values())
 
-        col_headers = [f"{d[5:]}" for d in dates]  # MM-DD
-        col_data    = []   # list of (header, cells, is_new_list, pct_list)
+        # 每天拆成兩欄：「名稱」欄 + 「漲跌」欄
+        # 名稱欄：新上榜 → 金色；其餘 → 正常白色
+        # 漲跌欄：上漲 → 紅色；下跌 → 綠色；平盤 → 灰色
+        col_data = []   # (date, name_cells, pct_cells, is_new_list, pct_list)
 
         for d in dates:
-            df_d = daily[d]
-            cells    = []
-            is_new_l = []
-            pct_l    = []
+            df_d      = daily[d]
+            name_cells = []
+            pct_cells  = []
+            is_new_l   = []
+            pct_l      = []
             for i in range(max_rows):
                 if i < len(df_d):
                     r      = df_d.iloc[i]
@@ -826,48 +827,68 @@ def page_history():
                     if pct > 0:   ps = f"▲{pct:.1f}%"
                     elif pct < 0: ps = f"▼{abs(pct):.1f}%"
                     else:         ps = "-0.0%"
-                    star = "★" if is_new else f"#{rank}"
-                    cells.append(f"{star} {name}  {ps}")
+                    prefix = "★ " if is_new else f"#{rank} "
+                    name_cells.append(prefix + name)
+                    pct_cells.append(ps)
                     is_new_l.append(is_new)
                     pct_l.append(pct)
                 else:
-                    cells.append("")
+                    name_cells.append("")
+                    pct_cells.append("")
                     is_new_l.append(False)
                     pct_l.append(0)
-            col_data.append((d, cells, is_new_l, pct_l))
+            col_data.append((d, name_cells, pct_cells, is_new_l, pct_l))
 
-        # Build DataFrame: rows = rank positions, cols = dates
+        # Build DataFrame: 排名 | MM-DD名稱 | MM-DD漲跌 | ...
         rows_dict = {"排名": [f"#{i+1}" for i in range(max_rows)]}
-        for d, cells, _, _ in col_data:
-            rows_dict[d[5:]] = cells   # MM-DD as column name
+        ordered_cols = ["排名"]
+        for d, name_cells, pct_cells, _, _ in col_data:
+            label      = d[5:]   # MM-DD
+            name_col   = f"{label} 名稱"
+            pct_col    = f"{label} 漲跌"
+            rows_dict[name_col] = name_cells
+            rows_dict[pct_col]  = pct_cells
+            ordered_cols += [name_col, pct_col]
 
-        disp = pd.DataFrame(rows_dict)
+        disp = pd.DataFrame(rows_dict)[ordered_cols]
 
-        # Build styles: (row_idx, col_name) -> css
-        all_col_data = {d[5:]: (cells, is_new_l, pct_l)
-                        for d, cells, is_new_l, pct_l in col_data}
+        # Styles per column
+        name_styles = {}   # col_name -> list of css per row
+        pct_styles  = {}
+
+        for d, name_cells, pct_cells, is_new_l, pct_l in col_data:
+            label    = d[5:]
+            name_col = f"{label} 名稱"
+            pct_col  = f"{label} 漲跌"
+            ns, ps   = [], []
+            for i, (is_new, pct) in enumerate(zip(is_new_l, pct_l)):
+                if name_cells[i] == "":
+                    ns.append("color: #1a2940")
+                    ps.append("color: #1a2940")
+                elif is_new:
+                    ns.append("color: #f39c12; font-weight: 700")   # 金色名稱
+                    # 漲跌幅仍用紅綠
+                    if pct > 0:   ps.append("color: #e74c3c; font-weight: 700")
+                    elif pct < 0: ps.append("color: #2ecc71; font-weight: 700")
+                    else:         ps.append("color: #5a6a80; font-weight: 700")
+                else:
+                    ns.append("color: #c8d6e5")
+                    if pct > 0:   ps.append("color: #e74c3c")
+                    elif pct < 0: ps.append("color: #2ecc71")
+                    else:         ps.append("color: #5a6a80")
+            name_styles[name_col] = ns
+            pct_styles[pct_col]   = ps
 
         def apply_col_styles(df_in):
-            base = "font-family: 'IBM Plex Mono', monospace; font-size: 12px; border: none; padding: 6px 10px"
+            base = "font-family: 'IBM Plex Mono', monospace; font-size: 12px; border: none; padding: 6px 8px"
             sdf  = pd.DataFrame(base, index=df_in.index, columns=df_in.columns)
-            # 排名欄
-            sdf["排名"] = base + "; color: #4a6080; text-align: center; width: 40px"
-            # 日期欄
-            for col_name, (cells, is_new_l, pct_l) in all_col_data.items():
-                if col_name not in df_in.columns: continue
-                col_styles = []
-                for i, (is_new, pct) in enumerate(zip(is_new_l, pct_l)):
-                    if cells[i] == "":
-                        col_styles.append(base + "; color: #1a2940")
-                    elif is_new:
-                        col_styles.append(base + "; background-color: #2a1800; color: #f39c12; font-weight: 700")
-                    elif pct > 0:
-                        col_styles.append(base + "; background-color: #1a0808; color: #e74c3c")
-                    elif pct < 0:
-                        col_styles.append(base + "; background-color: #041008; color: #2ecc71")
-                    else:
-                        col_styles.append(base + "; color: #5a6a80")
-                sdf[col_name] = col_styles
+            sdf["排名"] = base + "; color: #4a6080; text-align: center"
+            for col_name, styles in name_styles.items():
+                if col_name in df_in.columns:
+                    sdf[col_name] = [base + "; text-align: left; " + s for s in styles]
+            for col_name, styles in pct_styles.items():
+                if col_name in df_in.columns:
+                    sdf[col_name] = [base + "; text-align: right; " + s for s in styles]
             return sdf
 
         styled = (
