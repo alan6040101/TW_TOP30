@@ -163,39 +163,64 @@ def fetch_name_map() -> dict:
 # CB 可轉債：只用 FinMind（TWSE SSL 被 Streamlit Cloud 封，thefew.tw 無靜態資料）
 @st.cache_data(ttl=3600, show_spinner=False)
 def fetch_cb_stocks() -> tuple:
-    """回傳 (codes_set, source_label)"""
+    """
+    回傳 (codes_set, source_label)
+    從 FinMind TaiwanStockConvertibleBond 取可轉債資料，
+    自動識別欄位並從 CB 代號（6碼）推算股票代號（前4碼）
+    """
     token = _read_token()
     if not token:
         return set(), "無Token"
 
     try:
-        # FinMind TaiwanStockConvertibleBond — 取目前仍在流通的可轉債
         params = {"dataset": "TaiwanStockConvertibleBond", "token": token}
         r   = requests.get("https://api.finmindtrade.com/api/v4/data",
                            params=params, timeout=15)
         raw = r.json()
         if int(str(raw.get("status", 0))) == 200 and raw.get("data"):
-            df   = pd.DataFrame(raw["data"])
-            # 欄位中找股票代號欄
-            id_c = next((c for c in df.columns
-                         if c.lower() in ("stock_id","stockid","stock_code","underlying_stock_id")),
-                        None)
-            if id_c is None:
-                # fallback: 掃所有欄找 4 碼數字
-                codes = set()
+            df    = pd.DataFrame(raw["data"])
+            codes = set()
+
+            # 策略1：找明確的股票代號欄（4碼）
+            stock_cols = [c for c in df.columns
+                          if any(k in c.lower() for k in
+                                 ("stock_id","stockid","stock_code","underlying",
+                                  "標的","股票代號","證券代號"))]
+            for col in stock_cols:
+                for v in df[col].astype(str):
+                    s = v.strip()
+                    if re.match(r"^\d{4}$", s):
+                        codes.add(s)
+
+            # 策略2：找 CB 代號欄（通常6碼，前4碼是股票代號）
+            cb_cols = [c for c in df.columns
+                       if any(k in c.lower() for k in
+                              ("cb_id","cbid","bond","可轉債","cb代號","證券代號"))]
+            for col in cb_cols:
+                for v in df[col].astype(str):
+                    s = v.strip()
+                    if re.match(r"^\d{6}$", s):  # 6碼 CB 代號
+                        codes.add(s[:4])           # 前4碼 = 股票代號
+
+            # 策略3：全欄掃描（最後手段）
+            if not codes:
                 for col in df.columns:
                     for v in df[col].astype(str):
-                        if re.match(r"^\d{4}$", v.strip()):
-                            codes.add(v.strip())
-            else:
-                codes = {str(v).strip() for v in df[id_c]
-                         if re.match(r"^\d{4}$", str(v).strip())}
+                        s = v.strip()
+                        if re.match(r"^\d{4}$", s):
+                            codes.add(s)
+                        elif re.match(r"^\d{6}$", s):
+                            codes.add(s[:4])
+
             if codes:
-                return codes, f"FinMind ({len(codes)} 支)"
+                return codes, f"FinMind CB ({len(codes)} 支)"
+            else:
+                # 記錄欄位名稱供除錯
+                return set(), f"FinMind CB 無4碼股票代號，欄位={list(df.columns)[:6]}"
         else:
-            return set(), f"FinMind 回傳 status={raw.get('status')} msg={raw.get('msg','')}"
+            return set(), f"FinMind CB status={raw.get('status')} msg={raw.get('msg','')}"
     except Exception as e:
-        return set(), f"FinMind 例外: {e}"
+        return set(), f"FinMind CB 例外: {e}"
 
 # ─────────────────────────────────────────────────────────────────────────────
 # TIME — 台灣時間 UTC+8
@@ -924,6 +949,23 @@ def page_diag():
             st.dataframe(df_tmp.tail(5))
         else:
             st.error(f"無資料，完整回傳: {str(d)[:300]}")
+    except Exception as e:
+        st.error(f"Exception: {e}")
+
+    # ── 2b. FinMind TaiwanStockConvertibleBond 欄位檢查 ──
+    st.markdown("### 2b. FinMind TaiwanStockConvertibleBond（CB 欄位檢查）")
+    try:
+        r = requests.get("https://api.finmindtrade.com/api/v4/data",
+                         params={"dataset":"TaiwanStockConvertibleBond","token":token or ""},
+                         timeout=15)
+        d = r.json()
+        st.write(f"HTTP:{r.status_code} status:{d.get('status')} msg:{d.get('msg','')}")
+        if d.get("data"):
+            df_tmp = pd.DataFrame(d["data"])
+            st.write(f"筆數:{len(df_tmp)}  欄位:{list(df_tmp.columns)}")
+            st.dataframe(df_tmp.head(5))
+        else:
+            st.error(f"無資料: {str(d)[:300]}")
     except Exception as e:
         st.error(f"Exception: {e}")
 
