@@ -759,132 +759,211 @@ def page_history():
                              use_container_width=True, height=600, hide_index=True)
 
     else:
-        # ── 近5日新上榜觀察表 ──
+        # ── 近5日成交排行觀察表 ──
+        # 每欄 = 一個交易日；每列 = 當日排名
+        # 格式：股票名稱 漲跌幅，新上榜用金色標記
         sel_s = sorted(selected)[-5:]   # 最多取最近5天
 
-        # 建立每日 {code: row_dict}
+        # 建立每日資料：list of rows sorted by rank
         daily = {}
         for d in sel_s:
             raw = history.get(d)
             if raw is None: continue
             df_d = _prep_hist(raw)
-            daily[d] = {str(r["code"]): r for _, r in df_d.iterrows()}
+            df_d = df_d.sort_values("rank").head(30)
+            daily[d] = df_d.reset_index(drop=True)
 
         if not daily:
             st.warning("無有效資料"); return
 
-        dates     = sorted(daily.keys())
-        # 依各日出現頻率和成交金額排序
-        code_score = {}
-        for d in dates:
-            for code, r in daily[d].items():
-                tv = float(r.get("trade_value", 0) or 0)
-                code_score[code] = code_score.get(code, 0) + tv
-        all_codes = sorted(code_score.keys(), key=lambda c: -code_score[c])
+        dates = sorted(daily.keys())
 
-        # 找各日前一交易日的 code 集合
-        prev_day = {}
+        # 找各日前一交易日的 code 集合（用於標記新上榜）
+        prev_set = {}
         for d in dates:
             idx = all_sorted.index(d) if d in all_sorted else -1
             if idx > 0:
                 pr = history.get(all_sorted[idx - 1])
-                prev_day[d] = set(_prep_hist(pr)["code"].astype(str)) if pr is not None else set()
+                prev_set[d] = set(_prep_hist(pr)["code"].astype(str)) if pr is not None else set()
             else:
-                prev_day[d] = set()
+                prev_set[d] = set()
 
         period = f"{dates[0]} ~ {dates[-1]}" if len(dates) > 1 else dates[0]
-        st.markdown(f'<div class="section-title">近 {len(dates)} 日上榜觀察 · {period}</div>',
-                    unsafe_allow_html=True)
+        st.markdown(
+            f'<div class="section-title">近 {len(dates)} 日成交排行觀察 · {period}</div>',
+            unsafe_allow_html=True)
+
         st.markdown("""
         <div class="legend-strip">
             <span style="color:#4a6080;font-size:10px;letter-spacing:1px;text-transform:uppercase">圖例</span>
-            <div class="leg"><div class="dot" style="background:#191000"></div>
+            <div class="leg"><div class="dot" style="background:#2a1800"></div>
                 <span style="color:#f39c12">★ 新上榜（前日未在TOP30）</span></div>
-            <div class="leg"><div class="dot" style="background:#4a1212"></div>
+            <div class="leg"><div class="dot" style="background:#1a0808"></div>
                 <span style="color:#e74c3c">▲ 上漲</span></div>
-            <div class="leg"><div class="dot" style="background:#0a3018"></div>
+            <div class="leg"><div class="dot" style="background:#041008"></div>
                 <span style="color:#2ecc71">▼ 下跌</span></div>
-            <div class="leg" style="color:#2a3a50">• = 未上榜當日</div>
         </div>""", unsafe_allow_html=True)
 
-        col_names = ["股票名稱"] + [d[5:] for d in dates] + ["連續天數"]
-        rows, cell_styles = [], []
+        # ── 建立橫向表格：每欄一天，每列一個排名位置（1~30）──
+        max_rows = max(len(df_d) for df_d in daily.values())
 
-        for code in all_codes:
-            name = ""
-            for d in dates:
-                if code in daily[d]:
-                    name = str(daily[d][code].get("name", code)); break
+        col_headers = [f"{d[5:]}" for d in dates]  # MM-DD
+        col_data    = []   # list of (header, cells, is_new_list, pct_list)
 
-            consecutive = 0
-            for d in reversed(dates):
-                if code in daily[d]: consecutive += 1
-                else: break
-
-            row = [name]
-            rs  = {}
-            for ci, d in enumerate(dates, 1):
-                if code in daily[d]:
-                    info   = daily[d][code]
-                    rank   = int(info.get("rank", 99))
-                    pct    = float(info.get("change_pct", 0) or 0)
-                    is_new = code not in prev_day[d]
-                    if pct > 0:   pstr = f"▲{pct:.1f}%"
-                    elif pct < 0: pstr = f"▼{abs(pct):.1f}%"
-                    else:         pstr = "-0.0%"
-                    row.append(f"#{rank} {pstr}")
-                    if is_new:
-                        rs[ci] = "background-color:#191000;color:#f39c12;font-weight:700"
-                    elif pct > 0:
-                        rs[ci] = "background-color:#1a0808;color:#e74c3c"
-                    elif pct < 0:
-                        rs[ci] = "background-color:#041008;color:#2ecc71"
-                    else:
-                        rs[ci] = "color:#5a6a80"
+        for d in dates:
+            df_d = daily[d]
+            cells    = []
+            is_new_l = []
+            pct_l    = []
+            for i in range(max_rows):
+                if i < len(df_d):
+                    r      = df_d.iloc[i]
+                    code   = str(r["code"])
+                    name   = str(r["name"])
+                    pct    = float(r.get("change_pct", 0) or 0)
+                    rank   = int(r.get("rank", i+1))
+                    is_new = code not in prev_set[d]
+                    if pct > 0:   ps = f"▲{pct:.1f}%"
+                    elif pct < 0: ps = f"▼{abs(pct):.1f}%"
+                    else:         ps = "-0.0%"
+                    star = "★" if is_new else f"#{rank}"
+                    cells.append(f"{star} {name}  {ps}")
+                    is_new_l.append(is_new)
+                    pct_l.append(pct)
                 else:
-                    row.append("•")
-                    rs[ci] = "color:#2a3a50"
-            row.append(consecutive)
-            rows.append(row)
-            cell_styles.append(rs)
+                    cells.append("")
+                    is_new_l.append(False)
+                    pct_l.append(0)
+            col_data.append((d, cells, is_new_l, pct_l))
 
-        disp = pd.DataFrame(rows, columns=col_names)
+        # Build DataFrame: rows = rank positions, cols = dates
+        rows_dict = {"排名": [f"#{i+1}" for i in range(max_rows)]}
+        for d, cells, _, _ in col_data:
+            rows_dict[d[5:]] = cells   # MM-DD as column name
 
-        def apply_styles(df_in):
-            base = "font-family:'IBM Plex Mono',monospace;font-size:12px;border:none"
+        disp = pd.DataFrame(rows_dict)
+
+        # Build styles: (row_idx, col_name) -> css
+        all_col_data = {d[5:]: (cells, is_new_l, pct_l)
+                        for d, cells, is_new_l, pct_l in col_data}
+
+        def apply_col_styles(df_in):
+            base = "font-family: 'IBM Plex Mono', monospace; font-size: 12px; border: none; padding: 6px 10px"
             sdf  = pd.DataFrame(base, index=df_in.index, columns=df_in.columns)
-            sdf["股票名稱"] = base + ";color:#c8d6e5;text-align:left"
-            sdf["連續天數"] = base + ";color:#4fc3f7;text-align:center;font-weight:700"
-            for ri, rs in enumerate(cell_styles):
-                for ci, css in rs.items():
-                    col = col_names[ci]
-                    sdf.iloc[ri, df_in.columns.get_loc(col)] = base + ";" + css + ";text-align:center"
+            # 排名欄
+            sdf["排名"] = base + "; color: #4a6080; text-align: center; width: 40px"
+            # 日期欄
+            for col_name, (cells, is_new_l, pct_l) in all_col_data.items():
+                if col_name not in df_in.columns: continue
+                col_styles = []
+                for i, (is_new, pct) in enumerate(zip(is_new_l, pct_l)):
+                    if cells[i] == "":
+                        col_styles.append(base + "; color: #1a2940")
+                    elif is_new:
+                        col_styles.append(base + "; background-color: #2a1800; color: #f39c12; font-weight: 700")
+                    elif pct > 0:
+                        col_styles.append(base + "; background-color: #1a0808; color: #e74c3c")
+                    elif pct < 0:
+                        col_styles.append(base + "; background-color: #041008; color: #2ecc71")
+                    else:
+                        col_styles.append(base + "; color: #5a6a80")
+                sdf[col_name] = col_styles
             return sdf
 
         styled = (
-            disp.style.apply(apply_styles, axis=None)
+            disp.style
+            .apply(apply_col_styles, axis=None)
             .set_table_styles([
-                {"selector":"thead th","props":[
-                    ("background-color","#0a1520"),("color","#4a6080"),
-                    ("font-family","'IBM Plex Mono',monospace"),("font-size","11px"),
-                    ("letter-spacing","1.5px"),("text-transform","uppercase"),
-                    ("border-bottom","1px solid #1a2940"),("padding","8px 12px")]},
-                {"selector":"tbody td","props":[
-                    ("padding","8px 12px"),("border-bottom","1px solid #0d1a28")]},
-                {"selector":"tbody tr:hover td","props":[("filter","brightness(1.3)")]},
-                {"selector":"table","props":[("width","100%"),("border-collapse","collapse")]},
+                {"selector": "thead th", "props": [
+                    ("background-color", "#0a1520"), ("color", "#4a6080"),
+                    ("font-family", "'IBM Plex Mono', monospace"),
+                    ("font-size", "11px"), ("letter-spacing", "1.5px"),
+                    ("text-transform", "uppercase"),
+                    ("border-bottom", "1px solid #1a2940"),
+                    ("padding", "10px 12px"), ("text-align", "center"),
+                ]},
+                {"selector": "tbody td", "props": [
+                    ("border-bottom", "1px solid #0d1a28"),
+                    ("border-right", "1px solid #0d1a28"),
+                ]},
+                {"selector": "tbody tr:hover td", "props": [("filter", "brightness(1.25)")]},
+                {"selector": "table", "props": [("width", "100%"), ("border-collapse", "collapse")]},
             ])
             .hide(axis="index")
         )
-        height = min(max(len(disp) * 38 + 50, 400), 900)
+
+        height = min(max_rows * 40 + 60, 1200)
         st.dataframe(styled, use_container_width=True, height=height, hide_index=True)
 
+        # ── 熱度分析：近5日出現次數統計 ──
+        st.markdown('<div class="section-title">熱度分析 — 近期持續上榜</div>',
+                    unsafe_allow_html=True)
+
+        heat = {}
+        for d in dates:
+            for _, r in daily[d].iterrows():
+                code = str(r["code"])
+                name = str(r["name"])
+                if code not in heat:
+                    heat[code] = {"name": name, "days": 0, "avg_rank": [], "new_count": 0}
+                heat[code]["days"] += 1
+                heat[code]["avg_rank"].append(int(r.get("rank", 30)))
+                if code not in prev_set[d]:
+                    heat[code]["new_count"] += 1
+
+        heat_rows = []
+        for code, h in sorted(heat.items(), key=lambda x: (-x[1]["days"], sum(x[1]["avg_rank"])/len(x[1]["avg_rank"]))):
+            avg_r = round(sum(h["avg_rank"]) / len(h["avg_rank"]), 1)
+            heat_rows.append({
+                "股票名稱": h["name"],
+                "上榜天數": f"{h['days']}/{len(dates)}天",
+                "平均排名": f"#{avg_r}",
+                "新上榜次數": h["new_count"],
+            })
+
+        heat_df = pd.DataFrame(heat_rows)
+
+        def heat_style(df_in):
+            base = "font-family: 'IBM Plex Mono', monospace; font-size: 12px; border: none"
+            sdf  = pd.DataFrame(base, index=df_in.index, columns=df_in.columns)
+            for ri, row in heat_df.iterrows():
+                days_val = int(str(row["上榜天數"]).split("/")[0])
+                if days_val == len(dates):   # 每天都上榜
+                    sdf.iloc[ri] = base + "; background-color: #0a1e2a; color: #4fc3f7"
+                elif days_val >= len(dates) - 1:
+                    sdf.iloc[ri] = base + "; color: #c8d6e5"
+                else:
+                    sdf.iloc[ri] = base + "; color: #5a6a80"
+            return sdf
+
+        st.dataframe(
+            heat_df.style.apply(heat_style, axis=None)
+            .set_table_styles([
+                {"selector": "thead th", "props": [
+                    ("background-color", "#0a1520"), ("color", "#4a6080"),
+                    ("font-family", "'IBM Plex Mono', monospace"),
+                    ("font-size", "11px"), ("letter-spacing", "1.5px"),
+                    ("text-transform", "uppercase"),
+                    ("border-bottom", "1px solid #1a2940"), ("padding", "10px 14px"),
+                ]},
+                {"selector": "tbody td", "props": [
+                    ("padding", "8px 14px"), ("border-bottom", "1px solid #0d1a28"),
+                ]},
+                {"selector": "table", "props": [("width", "100%"), ("border-collapse", "collapse")]},
+            ])
+            .hide(axis="index"),
+            use_container_width=True,
+            height=min(len(heat_rows) * 38 + 50, 500),
+            hide_index=True,
+        )
+
         # 摘要：最後一天新上榜
-        last_d    = dates[-1]
-        new_today = [c for c in daily.get(last_d, {}) if c not in prev_day.get(last_d, set())]
-        if new_today:
-            names_new = [str(daily[last_d][c].get("name", c)) for c in new_today]
-            st.info(f"📌 {last_d} 新上榜（{len(new_today)}支）：" + "、".join(names_new))
+        last_d   = dates[-1]
+        new_last = [str(daily[last_d].iloc[i]["name"])
+                    for i in range(len(daily[last_d]))
+                    if str(daily[last_d].iloc[i]["code"]) not in prev_set[last_d]]
+        if new_last:
+            st.info(f"📌 {last_d} 新上榜（{len(new_last)}支）：{'、'.join(new_last)}")
 
 # ─────────────────────────────────────────────────────────────────────────────
 # MAIN
