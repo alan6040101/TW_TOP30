@@ -256,25 +256,36 @@ def _yf_top30(symbols, name_pool, period_kw: dict) -> tuple:
     except Exception as e:
         return pd.DataFrame(), f"yfinance 例外: {e}"
 
+def _prev_trade_date(date_str: str) -> str:
+    """取前一個交易日"""
+    d = datetime.strptime(date_str, "%Y-%m-%d") - timedelta(days=1)
+    while d.weekday() >= 5:
+        d -= timedelta(days=1)
+    return d.strftime("%Y-%m-%d")
+
 @st.cache_data(ttl=170, show_spinner=False)
 def fetch_top30(trade_date: str) -> tuple:
     """盤後成交排行。主：FinMind；備：yfinance。回傳 (df, source)"""
     name_map = fetch_name_map()
 
-    df_fm = _fm_stock_price(trade_date)
-    if len(df_fm) >= 10:
-        df_fm["name"] = df_fm["stock_id"].map(name_map).fillna(df_fm["stock_id"])
-        df_fm = df_fm.sort_values("trade_value", ascending=False).head(30).reset_index(drop=True)
-        df_fm["rank"] = range(1, len(df_fm) + 1)
-        return (df_fm.rename(columns={"stock_id": "code"})
-                [["rank", "code", "name", "trade_value", "change_pct"]],
-                "FinMind TaiwanStockPrice")
+    # FinMind 主要來源 — 嘗試今日，若空則試前一交易日
+    for attempt_date in [trade_date, _prev_trade_date(trade_date)]:
+        df_fm = _fm_stock_price(attempt_date)
+        if len(df_fm) >= 10:
+            df_fm["name"] = df_fm["stock_id"].map(name_map).fillna(df_fm["stock_id"])
+            df_fm = df_fm.sort_values("trade_value", ascending=False).head(30).reset_index(drop=True)
+            df_fm["rank"] = range(1, len(df_fm) + 1)
+            label = "FinMind TaiwanStockPrice" + ("" if attempt_date == trade_date else f" ({attempt_date})")
+            return (df_fm.rename(columns={"stock_id": "code"})
+                    [["rank", "code", "name", "trade_value", "change_pct"]],
+                    label)
 
+    # yfinance 備援 — 用 period 而非 start/end 確保有資料
     symbols = [f"{c}.TW" for c in STOCK_POOL]
-    start = (datetime.strptime(trade_date, "%Y-%m-%d") - timedelta(days=7)).strftime("%Y-%m-%d")
-    end   = (datetime.strptime(trade_date, "%Y-%m-%d") + timedelta(days=1)).strftime("%Y-%m-%d")
-    df, src = _yf_top30(symbols, STOCK_POOL, {"start": start, "end": end})
-    return df, src or "yfinance (備援)"
+    df, err = _yf_top30(symbols, STOCK_POOL, {"period": "5d", "interval": "1d"})
+    if len(df) >= 10:
+        return df, "yfinance (備援)"
+    return pd.DataFrame(), f"FinMind 和 yfinance 均失敗: {err}"
 
 @st.cache_data(ttl=170, show_spinner=False)
 def fetch_realtime_top30() -> tuple:
