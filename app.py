@@ -994,5 +994,4 @@ def main():
     if "即時" in page: page_realtime()
     else:              page_history()
 
-if __name__ == "__main__":
-    main()
+main()
