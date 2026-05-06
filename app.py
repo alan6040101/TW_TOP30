@@ -168,20 +168,20 @@ def fetch_cb_stocks() -> tuple:
     """
     回傳 (codes_set, source_label)
 
-    來源1: FinMind TaiwanStockConvertibleBondInfo（需付費帳號）
-    來源2: thefew.tw API endpoints（JSON）
-    來源3: thefew.tw HTML 解析（掃 6碼CB代號取前4碼）
+    thefew.tw 是 React SPA，資料透過 JS fetch 載入。
+    策略：先取 HTML，找 script bundle URL，
+    再從 JS bundle 中搜尋 API endpoint，最後呼叫該 endpoint。
+    同時嘗試 FinMind（需付費）。
     """
     token = _read_token()
-    FM_BASE = "https://api.finmindtrade.com/api/v4/data"
 
-    # ── 來源1: FinMind（需升級帳號，但仍嘗試）──
+    # ── 來源1: FinMind（需付費，留著以防升級）──
     if token:
         for ds in ["TaiwanStockConvertibleBondInfo",
-                   "TaiwanStockConvertibleBondDetail",
-                   "TaiwanStockConvertibleBondPremium"]:
+                   "TaiwanStockConvertibleBondDetail"]:
             try:
-                r   = requests.get(FM_BASE, params={"dataset": ds, "token": token}, timeout=10)
+                r   = requests.get("https://api.finmindtrade.com/api/v4/data",
+                                   params={"dataset": ds, "token": token}, timeout=10)
                 raw = r.json()
                 if int(str(raw.get("status", 0))) == 200 and raw.get("data"):
                     df    = pd.DataFrame(raw["data"])
@@ -196,79 +196,124 @@ def fetch_cb_stocks() -> tuple:
             except Exception:
                 continue
 
-    # ── 來源2: thefew.tw JSON API（試多個 endpoint）──
-    thefew_hdrs = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/124",
-        "Accept": "application/json, text/plain, */*",
-        "Referer": "https://thefew.tw/",
-        "Origin":  "https://thefew.tw",
-    }
-    for path in ["/api/cb", "/api/cb-list", "/api/cb-stocks",
-                 "/api/convertible-bonds", "/api/stocks/cb",
-                 "/api/cb-data", "/api/bond/cb"]:
-        try:
-            r = requests.get(f"https://thefew.tw{path}",
-                             headers=thefew_hdrs, timeout=10)
-            if r.status_code == 200:
-                try:
-                    data = r.json()
-                    codes = set()
-                    # 遞迴搜尋所有值
-                    def _dig(obj):
-                        if isinstance(obj, dict):
-                            for k, v in obj.items():
-                                if k.lower() in ("stock_id","stockid","code","股票代號",
-                                                 "stock_code","underlying"):
-                                    s = str(v).strip()
-                                    if re.match(r"^\d{4}$", s): codes.add(s)
-                                    elif re.match(r"^\d{6}$", s): codes.add(s[:4])
-                                _dig(v)
-                        elif isinstance(obj, list):
-                            for item in obj: _dig(item)
-                    _dig(data)
-                    if len(codes) >= 5:
-                        return codes, f"thefew.tw{path} ({len(codes)}支)"
-                except Exception:
-                    pass
-        except Exception:
-            continue
-
-    # ── 來源3: thefew.tw HTML — 掃 6碼 CB 代號（如 123401），前4碼是股票代號 ──
-    # thefew.tw 顯示的是可轉債清單，CB 代號格式：股票代號(4碼) + 期別(2碼)
-    # 例：台積電可轉債 = 233001, 233002...  → 股票代號 2330
+    # ── 來源2: thefew.tw — 從 JS bundle 找 API endpoint ──
     try:
         from bs4 import BeautifulSoup
-        html_hdrs = {
+
+        base_hdrs = {
             "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/124",
-            "Accept": "text/html,application/xhtml+xml;q=0.9,*/*;q=0.8",
             "Accept-Language": "zh-TW,zh;q=0.9",
         }
-        r    = requests.get("https://thefew.tw/cb", headers=html_hdrs, timeout=15)
-        soup = BeautifulSoup(r.text, "html.parser")
-        codes = set()
 
-        # 取所有文字節點，找 6碼數字（CB代號）→ 前4碼為股票代號
-        # 排除 4碼但避免收到非股票的數字（年份、頁碼等）
-        all_text = soup.get_text(" ", strip=True)
+        # Step1: 取 HTML，找所有 <script src>
+        r_html = requests.get("https://thefew.tw/cb",
+                              headers={**base_hdrs, "Accept": "text/html"},
+                              timeout=15)
+        soup   = BeautifulSoup(r_html.text, "html.parser")
 
-        # 6碼 CB 代號：第1~4碼是股票代號，第5~6碼是期別(01~99)
-        # 台灣上市股票代號範圍：1000-9999
-        cb_pattern = re.finditer(r'(\d{4})(0[1-9]|[1-9]\d)', all_text)
-        for m in cb_pattern:
-            stock_code = m.group(1)
-            # 合理的股票代號範圍（排除年份等）
-            if 1000 <= int(stock_code) <= 9999:
-                codes.add(stock_code)
+        # 找 main JS bundle（通常是 _next/static/chunks/pages/cb-*.js）
+        script_srcs = []
+        for tag in soup.find_all("script", src=True):
+            s = tag["src"]
+            if "cb" in s.lower() or "main" in s.lower() or "chunk" in s.lower():
+                if s.startswith("/"):
+                    s = "https://thefew.tw" + s
+                script_srcs.append(s)
 
-        # 也掃 data 屬性
-        for tag in soup.find_all(True):
-            for attr in ["data-stock", "data-id", "data-code", "data-stock-id"]:
-                val = str(tag.get(attr, "")).strip()
-                if re.match(r"^\d{4}$", val): codes.add(val)
-                elif re.match(r"^\d{6}$", val): codes.add(val[:4])
+        # Step2: 掃 JS bundle 找 fetch/axios URL
+        api_endpoints = set()
+        for js_url in script_srcs[:5]:
+            try:
+                r_js = requests.get(js_url,
+                                    headers={**base_hdrs, "Accept": "*/*",
+                                             "Referer": "https://thefew.tw/"},
+                                    timeout=10)
+                js_text = r_js.text
+                # 找 /api/ 路徑
+                found = re.findall(r'"(/api/[a-zA-Z0-9/_-]+)"', js_text)
+                api_endpoints.update(found)
+                # 找外部 API URL
+                ext = re.findall(r'"(https?://[^"]+/api/[^"]+)"', js_text)
+                api_endpoints.update(ext)
+            except Exception:
+                continue
 
-        if len(codes) >= 5:
-            return codes, f"thefew.tw HTML ({len(codes)}支)"
+        # Step3: 嘗試找到的 API endpoint
+        for ep in api_endpoints:
+            if any(k in ep.lower() for k in ["cb", "bond", "convert"]):
+                url = ep if ep.startswith("http") else f"https://thefew.tw{ep}"
+                try:
+                    r_api = requests.get(url,
+                                         headers={**base_hdrs, "Accept": "application/json",
+                                                  "Referer": "https://thefew.tw/"},
+                                         timeout=10)
+                    if r_api.status_code == 200:
+                        data = r_api.json()
+                        codes = set()
+                        def _dig(obj):
+                            if isinstance(obj, dict):
+                                for k, v in obj.items():
+                                    if k.lower() in ("stock_id","stockid","code",
+                                                     "股票代號","stock_code"):
+                                        s = str(v).strip()
+                                        if re.match(r"^\d{4}$", s): codes.add(s)
+                                        elif re.match(r"^\d{6}$", s): codes.add(s[:4])
+                                    _dig(v)
+                            elif isinstance(obj, list):
+                                for item in obj: _dig(item)
+                        _dig(data)
+                        if len(codes) >= 5:
+                            return codes, f"thefew.tw API ({len(codes)}支)"
+                except Exception:
+                    continue
+
+        # Step4: 若沒找到 API，從 JS bundle 直接解析 CB 代號清單
+        # 有些 SPA 會把靜態資料直接打包在 JS 裡（如 ["2330","2454",...]）
+        for js_url in script_srcs[:5]:
+            try:
+                r_js = requests.get(js_url,
+                                    headers={**base_hdrs, "Accept": "*/*"},
+                                    timeout=10)
+                js_text = r_js.text
+                # 找 6碼 CB 代號群（如 ["123401","233001","246801"...]）
+                six_digit = re.findall(r'"(\d{6})"', js_text)
+                # CB代號：前2碼在10-99（上市代號），後2碼01-20（期次）
+                codes = set()
+                for s in six_digit:
+                    base = s[:4]
+                    seq  = s[4:]
+                    if (re.match(r"^\d{4}$", base) and
+                        1000 <= int(base) <= 9999 and
+                        1 <= int(seq) <= 30):
+                        codes.add(base)
+                if len(codes) >= 5:
+                    return codes, f"thefew.tw JS bundle ({len(codes)}支)"
+            except Exception:
+                continue
+
+    except Exception:
+        pass
+
+    # ── 來源3: TWSE CB（加 verify=False 繞過 SSL 錯誤）──
+    try:
+        import urllib3
+        urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+        for url in ["https://www.twse.com.tw/rwd/zh/cbInfo/CB_OVERVIEW",
+                    "https://www.twse.com.tw/rwd/zh/cbInfo/CB_BOND_INFO"]:
+            r = requests.get(url,
+                             headers={"User-Agent":"Mozilla/5.0",
+                                      "Referer":"https://www.twse.com.tw/"},
+                             timeout=12, verify=False)
+            d = r.json()
+            if d.get("stat") == "OK" and d.get("data"):
+                codes = set()
+                for row in d["data"]:
+                    for cell in row:
+                        s = str(cell).strip()
+                        if re.match(r"^\d{4}$", s): codes.add(s)
+                        elif re.match(r"^\d{6}$", s): codes.add(s[:4])
+                if len(codes) >= 5:
+                    return codes, f"TWSE ({len(codes)}支)"
     except Exception:
         pass
 
@@ -1020,18 +1065,32 @@ def page_diag():
                 st.warning(f"⚠ **{ds}**: {msg}")
         except Exception as e:
             st.error(f"❌ **{ds}**: {e}")
+    st.markdown("### 2b-2. thefew.tw script 分析")
+    try:
+        from bs4 import BeautifulSoup as BS2
+        r2 = requests.get("https://thefew.tw/cb",
+            headers={"User-Agent":"Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/124",
+                     "Accept":"text/html"}, timeout=12)
+        soup2 = BS2(r2.text, "html.parser")
+        scripts = [t["src"] for t in soup2.find_all("script", src=True)]
+        st.write(f"找到 {len(scripts)} 個 script src：")
+        for s2 in scripts[:10]: st.write(f"  {s2}")
 
-    st.markdown("### 2b-2. thefew.tw API endpoints")
-    for path in ["/api/cb","/api/cb-list","/api/cb-stocks","/api/convertible-bonds","/api/bond/cb"]:
-        try:
-            r = requests.get(f"https://thefew.tw{path}",
-                headers={"User-Agent":"Mozilla/5.0","Accept":"application/json","Referer":"https://thefew.tw/"},
-                timeout=8)
-            st.write(f"**{path}**: HTTP={r.status_code} Content-Type={r.headers.get('content-type','?')} 長度={len(r.text)}")
-            if r.status_code == 200 and 'json' in r.headers.get('content-type',''):
-                st.json(r.json())
-        except Exception as e:
-            st.write(f"**{path}**: {e}")
+        cb_scripts = [s2 for s2 in scripts if any(k in s2.lower() for k in ["cb","pages","main","chunk"])]
+        st.write(f"CB相關 scripts: {cb_scripts[:5]}")
+
+        for js_url in cb_scripts[:3]:
+            url2 = f"https://thefew.tw{js_url}" if js_url.startswith("/") else js_url
+            try:
+                rj = requests.get(url2, headers={"User-Agent":"Mozilla/5.0","Referer":"https://thefew.tw/"}, timeout=10)
+                jt = rj.text
+                apis = list(set(re.findall(r'"(/api/[a-zA-Z0-9/_-]+)"', jt)))
+                six  = list(set(re.findall(r'"\d{6}"', jt)))[:20]
+                st.write(f"**{js_url}** (長度:{len(jt)}) API路徑:{apis[:5]} 6碼數字範例:{six[:10]}")
+            except Exception as je:
+                st.write(f"**{js_url}** 錯誤: {je}")
+    except Exception as e2:
+        st.error(f"分析失敗: {e2}")
 
     st.markdown("### 2c. fetch_cb_stocks 最終結果")
     cb_set, cb_src = fetch_cb_stocks()
