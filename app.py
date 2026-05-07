@@ -198,6 +198,8 @@ def _fm_stock_price(date_str: str) -> pd.DataFrame:
         # 加 end_date 限制只取當日資料
         from datetime import datetime as _dt, timedelta as _td
         end_date = (_dt.strptime(date_str, "%Y-%m-%d") + _td(days=1)).strftime("%Y-%m-%d")
+        # FinMind TaiwanStockPrice: 全市場日資料
+        # API v4 需要 start_date (舊版用 date，已棄用)
         r = requests.get(
             "https://api.finmindtrade.com/api/v4/data",
             params={"dataset":    "TaiwanStockPrice",
@@ -361,39 +363,41 @@ def fetch_top30(trade_date: str) -> tuple:
 def fetch_realtime_top30() -> tuple:
     """
     盤中即時排行。
-    成交金額排行只能用 FinMind TaiwanStockPrice（官方真實資料）。
-    yfinance 的 close×volume 不等於台股官方成交金額，不適合用作排行依據。
-
-    盤中時 FinMind 今日資料尚未完整 → 顯示昨日資料並標注。
-    盤後 14:30 後 → 顯示今日完整資料。
+    來源優先順序：
+    1. FinMind TaiwanStockPrice 今日（盤後才有完整資料）
+    2. yfinance 今日累積成交（盤中估算，close×volume）
+    3. FinMind 昨日完整資料
     """
-    name_map  = fetch_name_map()
-    today     = tw_now().strftime("%Y-%m-%d")
+    name_map = fetch_name_map()
+    today    = tw_now().strftime("%Y-%m-%d")
 
-    # 嘗試取今日資料（盤後才會有完整資料）
-    df_today = _fm_stock_price(today)
-    if len(df_today) >= 10:
-        df_today["name"] = df_today["stock_id"].map(name_map).fillna(df_today["stock_id"])
-        df_today = df_today.sort_values("trade_value", ascending=False).head(30).reset_index(drop=True)
-        df_today["rank"] = range(1, len(df_today) + 1)
-        return (df_today.rename(columns={"stock_id": "code"})
+    # 1. FinMind 今日（盤後才完整）
+    df_fm = _fm_stock_price(today)
+    if len(df_fm) >= 10:
+        df_fm["name"] = df_fm["stock_id"].map(name_map).fillna(df_fm["stock_id"])
+        df_fm = df_fm.sort_values("trade_value", ascending=False).head(30).reset_index(drop=True)
+        df_fm["rank"] = range(1, len(df_fm) + 1)
+        return (df_fm.rename(columns={"stock_id": "code"})
                 [["rank", "code", "name", "trade_value", "change_pct"]],
                 "FinMind TaiwanStockPrice")
 
-    # 盤中：今日資料未完整，往前找最近有資料的交易日（最多找5天）
-    check = today
-    for _ in range(5):
-        check = _prev_trade_date(check)
-        df_prev = _fm_stock_price(check)
-        if len(df_prev) >= 10:
-            df_prev["name"] = df_prev["stock_id"].map(name_map).fillna(df_prev["stock_id"])
-            df_prev = df_prev.sort_values("trade_value", ascending=False).head(30).reset_index(drop=True)
-            df_prev["rank"] = range(1, len(df_prev) + 1)
-            return (df_prev.rename(columns={"stock_id": "code"})
-                    [["rank", "code", "name", "trade_value", "change_pct"]],
-                    f"FinMind {check}（盤中顯示前日資料）")
+    # 2. yfinance 盤中即時估算
+    df_yf, err_yf = _yf_top30(STOCK_POOL, STOCK_POOL, {"period": "2d", "interval": "1d"})
+    if len(df_yf) >= 10:
+        return df_yf, "yfinance 盤中估算"
 
-    return pd.DataFrame(), "FinMind 無法取得資料，請稍後重試"
+    # 3. FinMind 昨日
+    yesterday = _prev_trade_date(today)
+    df_yd = _fm_stock_price(yesterday)
+    if len(df_yd) >= 10:
+        df_yd["name"] = df_yd["stock_id"].map(name_map).fillna(df_yd["stock_id"])
+        df_yd = df_yd.sort_values("trade_value", ascending=False).head(30).reset_index(drop=True)
+        df_yd["rank"] = range(1, len(df_yd) + 1)
+        return (df_yd.rename(columns={"stock_id": "code"})
+                [["rank", "code", "name", "trade_value", "change_pct"]],
+                f"FinMind {yesterday}（前日）")
+
+    return pd.DataFrame(), f"無法取得資料：{err_yf}"
 
 # ─────────────────────────────────────────────────────────────────────────────
 # 月營收年增率 + 創歷史新高
@@ -1100,31 +1104,82 @@ def page_diag():
     if not st.button("▶ 執行診斷", type="primary"):
         st.info("點擊開始"); return
 
-    # 1. FinMind 今日、昨日、前日
-    st.markdown("### 1. FinMind TaiwanStockPrice")
-    from datetime import datetime, timedelta
+    from datetime import datetime as _dt, timedelta as _td
     today = tw.strftime("%Y-%m-%d")
-    dates_to_try = []
-    d = datetime.strptime(today, "%Y-%m-%d")
-    for _ in range(5):
-        d -= timedelta(days=1)
-        while d.weekday() >= 5:
-            d -= timedelta(days=1)
-        dates_to_try.append(d.strftime("%Y-%m-%d"))
+    end_today = (_dt.strptime(today, "%Y-%m-%d") + _td(days=1)).strftime("%Y-%m-%d")
 
-    for date in [today] + dates_to_try[:3]:
-        try:
-            r = requests.get("https://api.finmindtrade.com/api/v4/data",
-                params={"dataset":"TaiwanStockPrice","date":date,"token":token or ""},
-                timeout=20)
-            d2 = r.json()
-            rows = len(d2.get("data",[]))
-            st.write(f"**{date}**: HTTP={r.status_code} status={d2.get('status')} rows={rows} msg={str(d2.get('msg',''))[:60]}")
-            if rows > 0:
-                st.write("  sample:", d2["data"][0])
-                break
-        except Exception as e:
-            st.write(f"**{date}**: Error={e}")
+    # 1. FinMind TaiwanStockPrice 今日（start_date/end_date）— 測試新格式
+    st.markdown("### 1. FinMind TaiwanStockPrice 今日 (start_date/end_date)")
+    try:
+        r = requests.get("https://api.finmindtrade.com/api/v4/data",
+            params={"dataset":"TaiwanStockPrice",
+                    "start_date": today, "end_date": end_today,
+                    "token": token or ""},
+            timeout=20)
+        d2 = r.json()
+        rows = len(d2.get("data",[]))
+        st.write(f"HTTP={r.status_code} status={d2.get('status')} rows={rows} msg={str(d2.get('msg',''))[:80]}")
+        if rows > 0:
+            df_tmp = pd.DataFrame(d2["data"])
+            st.write(f"欄位: {list(df_tmp.columns)}")
+            st.write(f"日期範圍: {df_tmp['date'].min()} ~ {df_tmp['date'].max()}")
+            st.dataframe(df_tmp.sort_values("Trading_money", ascending=False).head(5))
+        else:
+            st.error("今日無資料（盤中正常，盤後才有）")
+    except Exception as e:
+        st.error(f"Exception: {e}")
+
+    # 1b. FinMind TaiwanStockPriceMinute 盤中即時（單股測試台積電）
+    st.markdown("### 1b. FinMind TaiwanStockPriceMinute (盤中即時，2330)")
+    try:
+        r = requests.get("https://api.finmindtrade.com/api/v4/data",
+            params={"dataset":"TaiwanStockPriceMinute",
+                    "data_id": "2330",
+                    "start_date": today,
+                    "token": token or ""},
+            timeout=20)
+        d3 = r.json()
+        rows3 = len(d3.get("data",[]))
+        st.write(f"HTTP={r.status_code} status={d3.get('status')} rows={rows3} msg={str(d3.get('msg',''))[:80]}")
+        if rows3 > 0:
+            df3 = pd.DataFrame(d3["data"])
+            st.write(f"欄位: {list(df3.columns)}")
+            st.dataframe(df3.tail(5))
+        else:
+            st.error("無分鐘資料")
+    except Exception as e:
+        st.error(f"Exception: {e}")
+
+    # 1c. FinMind TaiwanStockStatisticsOfOrderBook (盤中委買委賣)
+    st.markdown("### 1c. FinMind TaiwanStockTotalReturnIndex (全市場即時)")
+    try:
+        r = requests.get("https://api.finmindtrade.com/api/v4/data",
+            params={"dataset":"TaiwanStockTotalReturnIndex",
+                    "start_date": today,
+                    "token": token or ""},
+            timeout=20)
+        d4 = r.json()
+        rows4 = len(d4.get("data",[]))
+        st.write(f"HTTP={r.status_code} status={d4.get('status')} rows={rows4} msg={str(d4.get('msg',''))[:80]}")
+        if rows4 > 0:
+            df4 = pd.DataFrame(d4["data"])
+            st.write(f"欄位: {list(df4.columns)}")
+            st.dataframe(df4.tail(3))
+    except Exception as e:
+        st.error(f"Exception: {e}")
+
+    # 1d. Test _fm_stock_price function directly
+    st.markdown("### 1d. _fm_stock_price 函式測試")
+    try:
+        df_test = _fm_stock_price(today)
+        st.write(f"今日: {len(df_test)} 筆")
+        yd = _prev_trade_date(today)
+        df_yd = _fm_stock_price(yd)
+        st.write(f"昨日({yd}): {len(df_yd)} 筆")
+        if len(df_yd) > 0:
+            st.dataframe(df_yd.sort_values("trade_value",ascending=False).head(5)[["stock_id","trade_value","change_pct"]])
+    except Exception as e:
+        st.error(f"Exception: {e}")
 
     # 2. yfinance 單股測試
     st.markdown("### 2. yfinance 台積電 2330.TW")
