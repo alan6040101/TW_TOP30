@@ -242,63 +242,80 @@ _YF_CORE = [
     "6446","6547","2049","6176","2207","1101","1102","2337","6770","3443",
 ]
 
-def _yf_top30(symbols, name_pool, period_kw: dict) -> tuple:
-    """
-    yfinance 備援。
-    使用縮減的核心股票池（60支）加快速度，threads=False 避免 Streamlit Cloud 執行緒限制。
-    """
+def _yf_batch(syms: list, period_kw: dict) -> "pd.DataFrame | None":
+    """下載一批 yfinance 資料，失敗回傳 None"""
     try:
-        # 用核心股票池，加上 name_pool 裡的代號（取聯集但不超過60支）
-        core_syms = [f"{c}.TW" for c in _YF_CORE if c in name_pool][:60]
-        if not core_syms:
-            core_syms = list(symbols)[:60]
-
         raw = yf.download(
-            tickers=core_syms,
+            tickers=syms,
             auto_adjust=True,
             progress=False,
             threads=False,
             **period_kw
         )
         if raw.empty:
-            return pd.DataFrame(), "yfinance 無資料"
+            return None
+        return raw
+    except Exception:
+        return None
 
-        # 取最後一個有效列（盤中或收盤）
-        close_df  = raw["Close"].dropna(how="all").iloc[-1]
-        volume_df = raw["Volume"].dropna(how="all").iloc[-1]
-        n_rows    = len(raw["Close"].dropna(how="all"))
-        prev_df   = raw["Close"].dropna(how="all").iloc[-2] if n_rows >= 2 else close_df
 
-        rows = []
-        for sym in core_syms:
-            try:
-                code  = sym.replace(".TW", "")
-                close = float(close_df.get(sym) or 0)
-                vol   = float(volume_df.get(sym) or 0)
-                prev  = float(prev_df.get(sym) or close)
-                if close <= 0 or vol <= 0:
-                    continue
-                tv  = round(close * vol / 1e8, 2)
-                chg = round((close - prev) / prev * 100, 2) if prev > 0 and close != prev else 0.0
-                rows.append({
-                    "code": code,
-                    "name": name_pool.get(code, code),
-                    "trade_value": tv,
-                    "change_pct": chg,
-                })
-            except:
+def _yf_top30(symbols, name_pool, period_kw: dict) -> tuple:
+    """
+    yfinance 備援。
+    分批下載（每批20支）確保在 Streamlit Cloud 不超時。
+    """
+    core_syms = [f"{c}.TW" for c in _YF_CORE][:60]
+
+    # 分批：每批20支，取第一批成功的結果合併
+    batch_size = 20
+    all_rows = []
+
+    for i in range(0, len(core_syms), batch_size):
+        batch = core_syms[i:i+batch_size]
+        raw   = _yf_batch(batch, period_kw)
+        if raw is None:
+            continue
+
+        # yfinance multi-ticker: raw["Close"] 是 DataFrame，columns 是 ticker
+        try:
+            close_raw  = raw["Close"].dropna(how="all")
+            volume_raw = raw["Volume"].dropna(how="all")
+            if len(close_raw) == 0:
                 continue
 
-        if not rows:
-            return pd.DataFrame(), "yfinance 全部無資料"
+            close_s  = close_raw.iloc[-1]
+            volume_s = volume_raw.iloc[-1]
+            prev_s   = close_raw.iloc[-2] if len(close_raw) >= 2 else close_s
 
-        df = (pd.DataFrame(rows)
-              .sort_values("trade_value", ascending=False)
-              .head(30).reset_index(drop=True))
-        df["rank"] = range(1, len(df) + 1)
-        return df[["rank", "code", "name", "trade_value", "change_pct"]], "yfinance"
-    except Exception as e:
-        return pd.DataFrame(), f"yfinance 例外: {e}"
+            for sym in batch:
+                try:
+                    code  = sym.replace(".TW", "")
+                    close = float(close_s.get(sym) or 0)
+                    vol   = float(volume_s.get(sym) or 0)
+                    prev  = float(prev_s.get(sym) or close)
+                    if close <= 0 or vol <= 0:
+                        continue
+                    tv  = round(close * vol / 1e8, 2)
+                    chg = round((close - prev) / prev * 100, 2) if prev > 0 and close != prev else 0.0
+                    all_rows.append({
+                        "code": code,
+                        "name": name_pool.get(code, code),
+                        "trade_value": tv,
+                        "change_pct": chg,
+                    })
+                except Exception:
+                    continue
+        except Exception:
+            continue
+
+    if not all_rows:
+        return pd.DataFrame(), "yfinance 無資料"
+
+    df = (pd.DataFrame(all_rows)
+          .sort_values("trade_value", ascending=False)
+          .head(30).reset_index(drop=True))
+    df["rank"] = range(1, len(df) + 1)
+    return df[["rank", "code", "name", "trade_value", "change_pct"]], "yfinance"
 
 def _prev_trade_date(date_str: str) -> str:
     """取前一個交易日"""
@@ -324,51 +341,59 @@ def fetch_top30(trade_date: str) -> tuple:
                     [["rank", "code", "name", "trade_value", "change_pct"]],
                     label)
 
-    # yfinance 備援 — 用 period 而非 start/end 確保有資料
-    symbols = [f"{c}.TW" for c in STOCK_POOL]
-    df, err = _yf_top30(symbols, STOCK_POOL, {"period": "5d", "interval": "1d"})
-    if len(df) >= 10:
-        return df, "yfinance (備援)"
-    return pd.DataFrame(), f"FinMind 和 yfinance 均失敗: {err}"
+    # FinMind 找不到資料時，往前再多找幾天
+    check = _prev_trade_date(trade_date)
+    for _ in range(5):
+        df_check = _fm_stock_price(check)
+        if len(df_check) >= 10:
+            name_map2 = fetch_name_map()
+            df_check["name"] = df_check["stock_id"].map(name_map2).fillna(df_check["stock_id"])
+            df_check = df_check.sort_values("trade_value", ascending=False).head(30).reset_index(drop=True)
+            df_check["rank"] = range(1, len(df_check) + 1)
+            return (df_check.rename(columns={"stock_id": "code"})
+                    [["rank", "code", "name", "trade_value", "change_pct"]],
+                    f"FinMind {check}")
+        check = _prev_trade_date(check)
+
+    return pd.DataFrame(), "FinMind 無法取得資料，請稍後重試"
 
 @st.cache_data(ttl=170, show_spinner=False)
 def fetch_realtime_top30() -> tuple:
     """
     盤中即時排行。
-    主：FinMind TaiwanStockPrice（盤中資料盤後才完整，盤中可能空）
-    備援1：yfinance period=5d（取最新一列）
-    備援2：FinMind 昨日資料
+    成交金額排行只能用 FinMind TaiwanStockPrice（官方真實資料）。
+    yfinance 的 close×volume 不等於台股官方成交金額，不適合用作排行依據。
+
+    盤中時 FinMind 今日資料尚未完整 → 顯示昨日資料並標注。
+    盤後 14:30 後 → 顯示今日完整資料。
     """
-    name_map   = fetch_name_map()
-    today      = tw_now().strftime("%Y-%m-%d")
-    yesterday  = _prev_trade_date(today)
+    name_map  = fetch_name_map()
+    today     = tw_now().strftime("%Y-%m-%d")
 
-    # FinMind 今日（盤中時可能資料不足）
-    df_fm = _fm_stock_price(today)
-    if len(df_fm) >= 10:
-        df_fm["name"] = df_fm["stock_id"].map(name_map).fillna(df_fm["stock_id"])
-        df_fm = df_fm.sort_values("trade_value", ascending=False).head(30).reset_index(drop=True)
-        df_fm["rank"] = range(1, len(df_fm) + 1)
-        return (df_fm.rename(columns={"stock_id": "code"})
+    # 嘗試取今日資料（盤後才會有完整資料）
+    df_today = _fm_stock_price(today)
+    if len(df_today) >= 10:
+        df_today["name"] = df_today["stock_id"].map(name_map).fillna(df_today["stock_id"])
+        df_today = df_today.sort_values("trade_value", ascending=False).head(30).reset_index(drop=True)
+        df_today["rank"] = range(1, len(df_today) + 1)
+        return (df_today.rename(columns={"stock_id": "code"})
                 [["rank", "code", "name", "trade_value", "change_pct"]],
-                "FinMind 即時")
+                "FinMind TaiwanStockPrice")
 
-    # yfinance 備援
-    df_yf, err = _yf_top30(STOCK_POOL, STOCK_POOL, {"period": "5d", "interval": "1d"})
-    if len(df_yf) >= 10:
-        return df_yf, "yfinance 即時"
+    # 盤中：今日資料未完整，往前找最近有資料的交易日（最多找5天）
+    check = today
+    for _ in range(5):
+        check = _prev_trade_date(check)
+        df_prev = _fm_stock_price(check)
+        if len(df_prev) >= 10:
+            df_prev["name"] = df_prev["stock_id"].map(name_map).fillna(df_prev["stock_id"])
+            df_prev = df_prev.sort_values("trade_value", ascending=False).head(30).reset_index(drop=True)
+            df_prev["rank"] = range(1, len(df_prev) + 1)
+            return (df_prev.rename(columns={"stock_id": "code"})
+                    [["rank", "code", "name", "trade_value", "change_pct"]],
+                    f"FinMind {check}（盤中顯示前日資料）")
 
-    # FinMind 昨日收盤（確保一定有資料）
-    df_yd = _fm_stock_price(yesterday)
-    if len(df_yd) >= 10:
-        df_yd["name"] = df_yd["stock_id"].map(name_map).fillna(df_yd["stock_id"])
-        df_yd = df_yd.sort_values("trade_value", ascending=False).head(30).reset_index(drop=True)
-        df_yd["rank"] = range(1, len(df_yd) + 1)
-        return (df_yd.rename(columns={"stock_id": "code"})
-                [["rank", "code", "name", "trade_value", "change_pct"]],
-                f"FinMind {yesterday}（昨日）")
-
-    return pd.DataFrame(), f"所有來源均失敗: {err}"
+    return pd.DataFrame(), "FinMind 無法取得資料，請稍後重試"
 
 # ─────────────────────────────────────────────────────────────────────────────
 # 月營收年增率 + 創歷史新高
