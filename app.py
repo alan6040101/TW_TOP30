@@ -194,15 +194,23 @@ def _fm_stock_price(date_str: str) -> pd.DataFrame:
     if not token:
         return pd.DataFrame()
     try:
+        # FinMind API v4: TaiwanStockPrice 需要 start_date（原 date 參數已不支援）
+        # 加 end_date 限制只取當日資料
+        from datetime import datetime as _dt, timedelta as _td
+        end_date = (_dt.strptime(date_str, "%Y-%m-%d") + _td(days=1)).strftime("%Y-%m-%d")
         r = requests.get(
             "https://api.finmindtrade.com/api/v4/data",
-            params={"dataset": "TaiwanStockPrice",
-                    "date":    date_str,
-                    "token":   token},
+            params={"dataset":    "TaiwanStockPrice",
+                    "start_date": date_str,
+                    "end_date":   end_date,
+                    "token":      token},
             timeout=25)
         raw = r.json()
         if int(str(raw.get("status", 0))) == 200 and raw.get("data"):
             df = pd.DataFrame(raw["data"])
+            # 只取指定日期的資料
+            if "date" in df.columns:
+                df = df[df["date"].str.startswith(date_str)]
             need = {"stock_id", "Trading_money", "close", "spread"}
             if need.issubset(df.columns):
                 df["stock_id"]    = df["stock_id"].astype(str).str.strip()
