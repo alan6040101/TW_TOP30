@@ -1055,10 +1055,93 @@ def page_history():
 
 # ─────────────────────────────────────────────────────────────────────────────
 # MAIN
+def page_diag():
+    """診斷頁面"""
+    tw = tw_now()
+    st.markdown("## 🔧 API 診斷")
+    token = _read_token()
+    st.info(f"**Token:** {'✅ 長度 ' + str(len(token)) if token else '❌ 未讀到'}")
+    if token:
+        st.code(f"前20碼: {token[:20]}...")
+
+    if not st.button("▶ 執行診斷", type="primary"):
+        st.info("點擊開始"); return
+
+    # 1. FinMind 今日、昨日、前日
+    st.markdown("### 1. FinMind TaiwanStockPrice")
+    from datetime import datetime, timedelta
+    today = tw.strftime("%Y-%m-%d")
+    dates_to_try = []
+    d = datetime.strptime(today, "%Y-%m-%d")
+    for _ in range(5):
+        d -= timedelta(days=1)
+        while d.weekday() >= 5:
+            d -= timedelta(days=1)
+        dates_to_try.append(d.strftime("%Y-%m-%d"))
+
+    for date in [today] + dates_to_try[:3]:
+        try:
+            r = requests.get("https://api.finmindtrade.com/api/v4/data",
+                params={"dataset":"TaiwanStockPrice","date":date,"token":token or ""},
+                timeout=20)
+            d2 = r.json()
+            rows = len(d2.get("data",[]))
+            st.write(f"**{date}**: HTTP={r.status_code} status={d2.get('status')} rows={rows} msg={str(d2.get('msg',''))[:60]}")
+            if rows > 0:
+                st.write("  sample:", d2["data"][0])
+                break
+        except Exception as e:
+            st.write(f"**{date}**: Error={e}")
+
+    # 2. yfinance 單股測試
+    st.markdown("### 2. yfinance 台積電 2330.TW")
+    try:
+        t = yf.Ticker("2330.TW")
+        h = t.history(period="5d")
+        st.write(f"rows={len(h)}")
+        if not h.empty:
+            st.dataframe(h.tail(3)[["Close","Volume"]])
+        else:
+            st.error("回傳空資料")
+    except Exception as e:
+        st.error(f"Exception: {e}")
+
+    # 3. yfinance download 小批量
+    st.markdown("### 3. yfinance download 5支")
+    try:
+        raw = yf.download(["2330.TW","2454.TW","2317.TW","2303.TW","2308.TW"],
+            period="5d", auto_adjust=True, progress=False, threads=False)
+        st.write(f"shape={raw.shape}, empty={raw.empty}")
+        if not raw.empty:
+            st.write("Close tail:")
+            st.dataframe(raw["Close"].tail(3))
+    except Exception as e:
+        st.error(f"Exception: {e}")
+
+    # 4. FinMind 月營收
+    st.markdown("### 4. FinMind TaiwanStockMonthRevenue (2330)")
+    try:
+        from datetime import datetime, timedelta
+        start = (datetime.now() - timedelta(days=400)).strftime("%Y-%m-%d")
+        r = requests.get("https://api.finmindtrade.com/api/v4/data",
+            params={"dataset":"TaiwanStockMonthRevenue","data_id":"2330",
+                    "start_date":start,"token":token or ""},
+            timeout=15)
+        d3 = r.json()
+        rows3 = len(d3.get("data",[]))
+        st.write(f"HTTP={r.status_code} status={d3.get('status')} rows={rows3}")
+        if rows3: st.dataframe(pd.DataFrame(d3["data"]).tail(3))
+    except Exception as e:
+        st.error(f"Exception: {e}")
+
+    st.success("診斷完成！")
+
+
 def main():
-    page = st.radio("nav", ["📈  即時排行","📊  歷史排行"],
+    page = st.radio("nav", ["📈  即時排行","📊  歷史排行","🔧  診斷"],
                     horizontal=True, label_visibility="collapsed")
-    if "即時" in page: page_realtime()
-    else:              page_history()
+    if "即時" in page:   page_realtime()
+    elif "歷史" in page: page_history()
+    else:                page_diag()
 
 main()
